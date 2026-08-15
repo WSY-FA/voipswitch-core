@@ -1,0 +1,26 @@
+[package]
+name = "voipswitchd"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+aya.workspace = true
+argon2.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rand.workspace = true
+libc.workspace = true
+regex.workspace = true
+sea-orm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+crc32fast.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+voipswitch-core = { path = "../voipswitch-core" }
+ai-protocol = { path = "../../../voipswitch-ai/crates/ai-protocol" }
