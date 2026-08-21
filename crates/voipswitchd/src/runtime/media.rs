@@ -704,6 +704,7 @@ impl MediaBridge {
 }
 
 impl MediaBridgeHandle {
+    #[allow(dead_code)]
     pub(crate) async fn send_tts_rtp(
         &self,
         payload: &[u8],
