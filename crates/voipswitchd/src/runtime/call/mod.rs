@@ -144,6 +144,19 @@ impl SessionActor {
                 InboundRouteTarget::Extension(number) => {
                     direct_extension = Some((number, matched.transformed_caller.clone()));
                 }
+                InboundRouteTarget::AiAgent(agent_id) => {
+                    let Some(agent) = domain
+                        .ai_agents
+                        .iter()
+                        .find(|agent| agent.enabled && agent.agent_id == agent_id)
+                    else {
+                        reject_inbound(&writer, &event, 404).await?;
+                        return Ok(None);
+                    };
+                    warn!(agent_id = %agent.agent_id, "AI Agent target is configured but realtime AI session is not enabled");
+                    reject_inbound(&writer, &event, 480).await?;
+                    return Ok(None);
+                }
                 InboundRouteTarget::Auto => {}
             }
             NumberAnalysisRequest {
@@ -1384,6 +1397,7 @@ mod tests {
             outbound_routes: Vec::new(),
             recording_policies: Vec::new(),
             ai_policies: policies,
+            ai_agents: Vec::new(),
             version: 1,
         };
         let target = OutboundTarget::Endpoint {

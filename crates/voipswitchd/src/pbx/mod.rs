@@ -1,3 +1,4 @@
+pub(crate) mod ai_agent;
 pub(crate) mod ai_policy;
 mod command_helpers;
 pub mod domain;

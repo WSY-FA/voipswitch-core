@@ -154,6 +154,7 @@ pub struct DomainRuntimeConfig {
     pub outbound_routes: Vec<OutboundRouteConfig>,
     pub recording_policies: Vec<RecordingPolicyConfig>,
     pub ai_policies: Vec<AiPolicyConfig>,
+    pub ai_agents: Vec<crate::pbx::ai_agent::model::AiAgentConfig>,
     pub version: u64,
 }
 

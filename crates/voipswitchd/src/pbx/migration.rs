@@ -81,6 +81,7 @@ pub(crate) async fn migrate_domain_db(
         create_trunk_and_route_tables(conn, domain_id).await?;
         migrate_recording_policy_tables(conn).await?;
         create_ai_policy_tables(conn).await?;
+        create_ai_agent_tables(conn).await?;
         create_config_meta(conn).await?;
         seed_config_sequences(conn, domain_id).await?;
         seed_config_version(conn).await?;
@@ -201,6 +202,36 @@ async fn create_ai_policy_tables(conn: &DatabaseConnection) -> Result<()> {
             ON ai_policy(domain_id,enabled,direction,priority,id);
         CREATE INDEX IF NOT EXISTS idx_ai_policy_target_match
             ON ai_policy_target(domain_id,target_type,target_id,policy_id);"
+            .to_string(),
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn create_ai_agent_tables(conn: &DatabaseConnection) -> Result<()> {
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "CREATE TABLE IF NOT EXISTS ai_agent (
+            domain_id TEXT NOT NULL,
+            id INTEGER NOT NULL,
+            agent_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            service_number TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 1,
+            fallback_target TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(domain_id,id),
+            UNIQUE(domain_id,agent_id),
+            UNIQUE(domain_id,service_number),
+            CHECK(id > 0),
+            CHECK(length(agent_id) BETWEEN 1 AND 64),
+            CHECK(length(service_number) BETWEEN 1 AND 32)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_agent_number
+            ON ai_agent(domain_id,enabled,service_number);"
             .to_string(),
     ))
     .await?;

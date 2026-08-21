@@ -578,6 +578,7 @@ async fn load_domain_config(
     let recording_policies =
         crate::pbx::recording::config::load_recording_policies(&conn, &domain_id).await?;
     let ai_policies = crate::pbx::ai_policy::load_ai_policies(&conn, &domain_id).await?;
+    let ai_agents = crate::pbx::ai_agent::config::load_ai_agents(&conn, &domain_id).await?;
     let domain_config_version = load_domain_config_version(&conn).await?;
     let _ = backend;
 
@@ -596,6 +597,7 @@ async fn load_domain_config(
         outbound_routes,
         recording_policies,
         ai_policies,
+        ai_agents,
         version: domain_config_version.max(row.version.max(1) as u64),
     })
 }

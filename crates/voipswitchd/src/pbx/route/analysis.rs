@@ -22,6 +22,7 @@ pub(crate) enum InboundRouteTarget {
     Reject,
     Auto,
     Extension(String),
+    AiAgent(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,9 @@ pub(crate) fn analyze_inbound_route(
             let target = match route.target.as_str() {
                 "rej" => InboundRouteTarget::Reject,
                 "auto" => InboundRouteTarget::Auto,
+                value if value.starts_with("ai_agent:") => {
+                    InboundRouteTarget::AiAgent(value.strip_prefix("ai_agent:")?.to_string())
+                }
                 value => InboundRouteTarget::Extension(value.strip_prefix("ext-")?.to_string()),
             };
             return Some(InboundRouteMatch {
@@ -336,6 +340,7 @@ mod tests {
             outbound_routes: Vec::new(),
             recording_policies: Vec::new(),
             ai_policies: Vec::new(),
+            ai_agents: Vec::new(),
             version: 1,
         };
         domain
@@ -347,6 +352,48 @@ mod tests {
         assert_eq!(
             matched.target,
             InboundRouteTarget::Extension("1002".to_string())
+        );
+    }
+
+    #[test]
+    fn inbound_route_parses_ai_agent_target() {
+        let domain = crate::config_service::DomainRuntimeConfig {
+            domain_id: "domain-a".into(),
+            name: "A".to_string(),
+            realm: "example.com".to_string(),
+            password: "secret".to_string(),
+            remark: String::new(),
+            enabled: true,
+            extensions: Vec::new(),
+            peer_trunks: Vec::new(),
+            reg_trunks: Vec::new(),
+            reg_accounts: Vec::new(),
+            inbound_routes: vec![InboundRouteConfig {
+                id: 1,
+                name: "agent".to_string(),
+                enabled: true,
+                trunk_match: String::new(),
+                dst_pattern: "9000".to_string(),
+                src_pattern: None,
+                dst_strip: 0,
+                dst_prefix: String::new(),
+                dst_suffix: String::new(),
+                src_strip: 0,
+                src_prefix: String::new(),
+                src_suffix: String::new(),
+                target: "ai_agent:agent-sales".to_string(),
+                priority: 1,
+            }],
+            outbound_routes: Vec::new(),
+            recording_policies: Vec::new(),
+            ai_policies: Vec::new(),
+            ai_agents: Vec::new(),
+            version: 1,
+        };
+        let matched = analyze_inbound_route(&domain, "", "1001", "9000").unwrap();
+        assert_eq!(
+            matched.target,
+            InboundRouteTarget::AiAgent("agent-sales".to_string())
         );
     }
 }

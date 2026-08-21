@@ -1290,6 +1290,7 @@ mod tests {
                     outbound_routes: Vec::new(),
                     recording_policies: Vec::new(),
                     ai_policies: Vec::new(),
+                    ai_agents: Vec::new(),
                     version: 1,
                 }),
             )]),
