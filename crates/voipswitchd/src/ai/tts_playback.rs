@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +46,7 @@ impl TtsPlayback {
         pcm16_le: &[u8],
         codec: PlaybackCodec,
     ) -> Result<Vec<PlaybackFrame>> {
-        if pcm16_le.len() % 2 != 0 {
+        if !pcm16_le.len().is_multiple_of(2) {
             bail!("PCM16LE payload must contain complete samples");
         }
         let samples_per_packet = 160;
