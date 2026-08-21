@@ -378,42 +378,42 @@ impl SessionActor {
         let caller_session_id = format!("session-{}-caller", call_id);
         let callee_session_id = format!("session-{}-callee-attempt-1", call_id);
         let started_at_ms = unix_timestamp_ms();
-        if let OutboundTarget::AiAgent { agent_id } = &first_candidate.outbound_target {
-            if let Some(ai_jobs) = state.ai_jobs() {
-                let profile_id = domain
-                    .ai_agents
-                    .iter()
-                    .find(|agent| agent.agent_id == *agent_id)
-                    .map(|agent| agent.profile_id.clone());
-                if let Some(profile_id) = profile_id
-                    && let Some(profile) = ai_jobs.profile_snapshot(&profile_id)
-                {
-                    let request = StartConversation {
-                        conversation: JobRef {
-                            job_id: JobId::new(format!("ai-agent-{call_id}"))?,
-                            tenant_id: TenantId::new(event.domain_id.clone())?,
-                            conversation_id: ConversationId::new(call_id.clone())?,
-                            operation_id: OperationId::new("voice-agent-v1")?,
-                            generation: 1,
-                        },
-                        profile,
-                        participant: Participant {
-                            participant_id: ParticipantId::new("caller")?,
-                            role: "caller".to_string(),
-                            display_number: Some(event.caller_number.clone()),
-                        },
-                        input_stream: StreamBinding {
-                            stream_id: StreamId::new("caller-audio")?,
-                            participant_id: ParticipantId::new("caller")?,
-                            direction: MediaDirection::FromParticipant,
-                            codec: AudioCodec::Pcma,
-                            sample_rate: 8_000,
-                            channels: 1,
-                        },
-                    };
-                    if let Err(error) = ai_jobs.try_start_conversation(request) {
-                        warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
-                    }
+        if let OutboundTarget::AiAgent { agent_id } = &first_candidate.outbound_target
+            && let Some(ai_jobs) = state.ai_jobs()
+        {
+            let profile_id = domain
+                .ai_agents
+                .iter()
+                .find(|agent| agent.agent_id == *agent_id)
+                .map(|agent| agent.profile_id.clone());
+            if let Some(profile_id) = profile_id
+                && let Some(profile) = ai_jobs.profile_snapshot(&profile_id)
+            {
+                let request = StartConversation {
+                    conversation: JobRef {
+                        job_id: JobId::new(format!("ai-agent-{call_id}"))?,
+                        tenant_id: TenantId::new(event.domain_id.clone())?,
+                        conversation_id: ConversationId::new(call_id.clone())?,
+                        operation_id: OperationId::new("voice-agent-v1")?,
+                        generation: 1,
+                    },
+                    profile,
+                    participant: Participant {
+                        participant_id: ParticipantId::new("caller")?,
+                        role: "caller".to_string(),
+                        display_number: Some(event.caller_number.clone()),
+                    },
+                    input_stream: StreamBinding {
+                        stream_id: StreamId::new("caller-audio")?,
+                        participant_id: ParticipantId::new("caller")?,
+                        direction: MediaDirection::FromParticipant,
+                        codec: AudioCodec::Pcma,
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                };
+                if let Err(error) = ai_jobs.try_start_conversation(request) {
+                    warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
                 }
             }
         }
