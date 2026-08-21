@@ -38,8 +38,8 @@ use crate::runtime::call::actor::{CoordinatorRuntimeState, InitialCallAction, Pe
 use crate::runtime::media::{DtmfSessionBindings, MediaPlaneManager};
 use crate::runtime::recording::RecordingSpec;
 use ai_protocol::control::{
-    AiProfileSnapshot, AudioCodec, JobRef, MediaDirection, Participant, StreamBinding,
-    SubmitPostCallJob,
+    AiProfileSnapshot, AudioCodec, JobRef, MediaDirection, Participant, StartConversation,
+    StreamBinding, SubmitPostCallJob,
 };
 use ai_protocol::id::{ConversationId, JobId, OperationId, ParticipantId, StreamId, TenantId};
 use anyhow::{Result, anyhow};
@@ -124,6 +124,7 @@ impl SessionActor {
         let mut inbound_route_id = None;
         let mut inbound_route_name = None;
         let mut direct_extension = None;
+        let mut direct_ai_agent = None;
         let request = if let Some(trunk_ref) = inbound_trunk_ref.as_deref() {
             let Some(matched) = analyze_inbound_route(
                 domain,
@@ -153,9 +154,7 @@ impl SessionActor {
                         reject_inbound(&writer, &event, 404).await?;
                         return Ok(None);
                     };
-                    warn!(agent_id = %agent.agent_id, "AI Agent target is configured but realtime AI session is not enabled");
-                    reject_inbound(&writer, &event, 480).await?;
-                    return Ok(None);
+                    direct_ai_agent = Some(agent.clone());
                 }
                 InboundRouteTarget::Auto => {}
             }
@@ -171,7 +170,25 @@ impl SessionActor {
                 callee: event.callee_number.clone(),
             }
         };
-        let resolved_route = if let Some((number, signaling_caller_number)) = direct_extension {
+        let resolved_route = if let Some(agent) = direct_ai_agent {
+            ResolvedRoute {
+                signaling_caller_number: event.caller_number.clone(),
+                signaling_callee_number: agent.service_number.clone(),
+                candidates: vec![OutboundCandidate {
+                    outbound_target: OutboundTarget::AiAgent {
+                        agent_id: agent.agent_id,
+                    },
+                    callee_route_target: None,
+                    outbound_trunk_ref: None,
+                    outbound_trunk_name: None,
+                    recording_requested: false,
+                    recording_policy_ids: Arc::from([]),
+                    ai_policy: None,
+                }],
+                outbound_route_id: None,
+                outbound_route_name: None,
+            }
+        } else if let Some((number, signaling_caller_number)) = direct_extension {
             let Some(extension) = domain
                 .extensions
                 .iter()
@@ -361,6 +378,45 @@ impl SessionActor {
         let caller_session_id = format!("session-{}-caller", call_id);
         let callee_session_id = format!("session-{}-callee-attempt-1", call_id);
         let started_at_ms = unix_timestamp_ms();
+        if let OutboundTarget::AiAgent { agent_id } = &first_candidate.outbound_target {
+            if let Some(ai_jobs) = state.ai_jobs() {
+                let profile_id = domain
+                    .ai_agents
+                    .iter()
+                    .find(|agent| agent.agent_id == *agent_id)
+                    .map(|agent| agent.profile_id.clone());
+                if let Some(profile_id) = profile_id
+                    && let Some(profile) = ai_jobs.profile_snapshot(&profile_id)
+                {
+                    let request = StartConversation {
+                        conversation: JobRef {
+                            job_id: JobId::new(format!("ai-agent-{call_id}"))?,
+                            tenant_id: TenantId::new(event.domain_id.clone())?,
+                            conversation_id: ConversationId::new(call_id.clone())?,
+                            operation_id: OperationId::new("voice-agent-v1")?,
+                            generation: 1,
+                        },
+                        profile,
+                        participant: Participant {
+                            participant_id: ParticipantId::new("caller")?,
+                            role: "caller".to_string(),
+                            display_number: Some(event.caller_number.clone()),
+                        },
+                        input_stream: StreamBinding {
+                            stream_id: StreamId::new("caller-audio")?,
+                            participant_id: ParticipantId::new("caller")?,
+                            direction: MediaDirection::FromParticipant,
+                            codec: AudioCodec::Pcma,
+                            sample_rate: 8_000,
+                            channels: 1,
+                        },
+                    };
+                    if let Err(error) = ai_jobs.try_start_conversation(request) {
+                        warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
+                    }
+                }
+            }
+        }
         let route_deadline = tokio::time::Instant::now() + config_snapshot.timeouts.route_budget;
         let mut call = CallRuntime::new(
             call_id.clone(),
@@ -430,6 +486,7 @@ impl SessionActor {
                     "sdp_offer": callee_offer, "sip_metadata": {}, "extension_headers": {},
                 }),
             }),
+            OutboundTarget::AiAgent { .. } => {}
         }
         let callee_session = call
             .make_callee_session(
@@ -1096,10 +1153,12 @@ fn ai_policy_for_candidate(
     let outbound_trunk_ref = match outbound_target {
         OutboundTarget::Trunk { trunk_ref } => Some(trunk_ref.as_str()),
         OutboundTarget::Endpoint { .. } => None,
+        OutboundTarget::AiAgent { .. } => None,
     };
     let callee_extension_id = match outbound_target {
         OutboundTarget::Endpoint { endpoint_id, .. } => endpoint_id.parse::<u64>().ok(),
         OutboundTarget::Trunk { .. } => None,
+        OutboundTarget::AiAgent { .. } => None,
     };
     domain
         .ai_policies

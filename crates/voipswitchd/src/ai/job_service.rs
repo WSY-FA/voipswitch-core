@@ -5,7 +5,9 @@ use super::{
 };
 use crate::data_store::{AiCallResultRecord, ConfigBackend};
 use crate::runtime::media::MediaBridgeHandle;
-use ai_protocol::control::{ControlMessage, JobResultRequest, JobState, SubmitPostCallJob};
+use ai_protocol::control::{
+    ControlMessage, JobResultRequest, JobState, StartConversation, SubmitPostCallJob,
+};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -72,6 +74,22 @@ impl AiJobService {
 
     pub(crate) fn profile_catalog(&self) -> Option<ai_protocol::control::ProfileCatalogSnapshot> {
         self.connector.profile_catalog()
+    }
+
+    pub(crate) fn profile_snapshot(
+        &self,
+        profile_id: &str,
+    ) -> Option<ai_protocol::control::AiProfileSnapshot> {
+        self.connector
+            .profile_catalog()?
+            .profiles
+            .into_iter()
+            .find(|projection| projection.profile.profile_id.as_str() == profile_id)
+            .map(|projection| projection.profile)
+    }
+
+    pub(crate) fn try_start_conversation(&self, request: StartConversation) -> Result<()> {
+        self.connector.try_start_conversation(request)
     }
 
     pub(crate) fn try_submit(

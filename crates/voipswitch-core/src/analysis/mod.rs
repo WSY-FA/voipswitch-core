@@ -145,6 +145,9 @@ pub enum CalleeTarget {
     Trunk {
         trunk_id: TrunkId,
     },
+    AiAgent {
+        agent_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

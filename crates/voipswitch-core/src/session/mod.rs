@@ -22,6 +22,7 @@ pub enum SessionEndpoint {
     Endpoint(EndpointRef),
     Trunk { trunk_id: TrunkId },
     External { number: String },
+    AiAgent { agent_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

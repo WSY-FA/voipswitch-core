@@ -150,6 +150,13 @@ impl AiConnector {
         })
     }
 
+    pub(crate) fn try_start_conversation(
+        &self,
+        request: ai_protocol::control::StartConversation,
+    ) -> Result<()> {
+        self.try_send(ControlMessage::StartConversation(request))
+    }
+
     pub(crate) fn try_send_media(&self, frame: MediaFrame) -> bool {
         match self.media_tx.try_send(frame) {
             Ok(()) => true,

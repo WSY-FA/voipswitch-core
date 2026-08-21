@@ -434,6 +434,7 @@ impl SessionActor {
                     "extension_headers": {},
                 }),
             ),
+            OutboundTarget::AiAgent { .. } => Ok(()),
         }
     }
 

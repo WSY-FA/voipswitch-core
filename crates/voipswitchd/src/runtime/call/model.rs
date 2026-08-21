@@ -353,6 +353,9 @@ pub(crate) enum OutboundTarget {
     Trunk {
         trunk_ref: String,
     },
+    AiAgent {
+        agent_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +382,7 @@ impl OutboundTarget {
         match self {
             Self::Endpoint { endpoint_id, .. } => format!("endpoint:{endpoint_id}"),
             Self::Trunk { trunk_ref } => trunk_ref.clone(),
+            Self::AiAgent { agent_id } => format!("ai_agent:{agent_id}"),
         }
     }
 
@@ -395,6 +399,9 @@ impl OutboundTarget {
             Self::Trunk { trunk_ref } => Ok(CalleeTarget::Trunk {
                 trunk_id: TrunkId::from(trunk_ref.clone()),
             }),
+            Self::AiAgent { agent_id } => Ok(CalleeTarget::AiAgent {
+                agent_id: agent_id.clone(),
+            }),
         }
     }
 
@@ -410,6 +417,9 @@ impl OutboundTarget {
             })),
             Self::Trunk { trunk_ref } => Ok(SessionEndpoint::Trunk {
                 trunk_id: TrunkId::from(trunk_ref.clone()),
+            }),
+            Self::AiAgent { agent_id } => Ok(SessionEndpoint::AiAgent {
+                agent_id: agent_id.clone(),
             }),
         }
     }

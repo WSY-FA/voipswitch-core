@@ -274,6 +274,21 @@ impl SessionActor {
                     break;
                 }
             }
+            if !self.finalization_started && self.call.callee_target.starts_with("ai_agent:") {
+                self.media_generation = self.media_generation.saturating_add(1);
+                if let Err(error) = self.media_executor.prepare_sdp(
+                    format!("prepare-ai-agent-answer-{}", self.call.call_id()),
+                    self.media_generation,
+                    crate::runtime::call::media_action::PrepareSdpPurpose::Answer {
+                        payload_types: Vec::new(),
+                    },
+                    self.caller_offer.clone(),
+                ) {
+                    warn!(call_id = self.call.call_id(), error = %error, "AI Agent media answer preparation failed");
+                    self.call.begin_terminating(HangupCause::InternalError);
+                    self.begin_finish_call();
+                }
+            }
             if !self.finalization_started {
                 self.start_timer(crate::runtime::call::timer::CallTimerKind::Dial);
                 self.publish_call_view();
