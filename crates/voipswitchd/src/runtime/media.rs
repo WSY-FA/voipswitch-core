@@ -704,6 +704,36 @@ impl MediaBridge {
 }
 
 impl MediaBridgeHandle {
+    pub(crate) async fn send_tts_rtp(
+        &self,
+        payload: &[u8],
+        payload_type: u8,
+        timestamp: u32,
+        sequence: u16,
+        ssrc: u32,
+    ) -> Result<usize> {
+        if self.stopped.load(Ordering::Acquire) {
+            bail!("call_or_leg_terminating");
+        }
+        let remote = self
+            .caller_remote_rtp
+            .read()
+            .await
+            .as_ref()
+            .copied()
+            .context("caller RTP remote is not ready")?;
+        let mut packet = Vec::with_capacity(12 + payload.len());
+        packet.extend_from_slice(&[0x80, payload_type & 0x7f]);
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&timestamp.to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(payload);
+        self.caller_rtp
+            .send_to(&packet, remote)
+            .await
+            .context("send TTS RTP packet")
+    }
+
     pub(crate) fn bind_dtmf_sessions(&self, bindings: DtmfSessionBindings) {
         self.dtmf_dispatch.send_replace(Some(DtmfDispatchBindings {
             domain_id: DomainId::from(bindings.domain_id),
