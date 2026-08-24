@@ -22,6 +22,8 @@ pub(crate) struct CallRuntime {
     pub(crate) caller_number: String,
     pub(crate) callee_number: String,
     pub(crate) callee_target: String,
+    pub(crate) ai_agent_revision: Option<u64>,
+    pub(crate) ai_fallback_target: Option<String>,
     pub(crate) inbound_route_id: Option<String>,
     pub(crate) inbound_route_name: Option<String>,
     pub(crate) inbound_trunk_ref: Option<String>,
@@ -134,6 +136,8 @@ impl CallRuntime {
             caller_number,
             callee_number,
             callee_target: candidate.outbound_target.stable_ref(),
+            ai_agent_revision: candidate.ai_agent_revision,
+            ai_fallback_target: candidate.ai_fallback_target.clone(),
             outbound_trunk_ref: candidate.outbound_trunk_ref.clone(),
             outbound_trunk_name: candidate.outbound_trunk_name.clone(),
             recording_requested: config_snapshot.recording.initial_requested,
@@ -367,6 +371,8 @@ pub(crate) struct OutboundCandidate {
     pub(crate) recording_requested: bool,
     pub(crate) recording_policy_ids: Arc<[u64]>,
     pub(crate) ai_policy: Option<AiPolicyDecisionSnapshot>,
+    pub(crate) ai_agent_revision: Option<u64>,
+    pub(crate) ai_fallback_target: Option<String>,
 }
 
 pub(crate) struct ResolvedRoute {

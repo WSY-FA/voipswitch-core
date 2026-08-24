@@ -204,6 +204,11 @@ fn build_leg_cdrs(
 
 async fn finalize_call(state: AppState, call: FinalCallSnapshot, media: Option<MediaBridge>) {
     let call_id = call.call_id.clone();
+    if let Some(ai_jobs) = state.ai_jobs()
+        && call.callee_target.starts_with("ai_agent:")
+    {
+        ai_jobs.unregister_voice_coordinator(&call_id);
+    }
     let (media_stats, mut recording, media_forwarding_mode) = match media {
         Some(media) => {
             let finalized = media.stop(&call_id).await;

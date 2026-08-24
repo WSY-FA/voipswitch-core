@@ -1664,6 +1664,7 @@ mod tests {
                 key_points: vec!["point".to_string()],
                 action_items: vec!["follow up".to_string()],
                 tags: vec!["support".to_string()],
+                action: None,
             },
             received_at_ms: 1_000,
         }

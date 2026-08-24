@@ -28,7 +28,7 @@ use self::model::{CallRuntime, OutboundCandidate, OutboundTarget, ResolvedRoute}
 use self::registry::LegEventDeduper;
 use self::session::{CallCoordinatorHandle, CriticalControlDispatcher, SessionHandle};
 use self::timer::{CallTimeouts, CallTimerKind};
-use crate::ai::{AiMediaTapSpec, AiTapStreamSpec};
+use crate::ai::{AiMediaTapSpec, AiTapStreamSpec, PlaybackCodec, TtsPlayback};
 use crate::app::{AppState, RegistrationState};
 use crate::pbx::recording::model::{RecordingDirection, RecordingTargetType};
 use crate::pbx::route::analysis::{InboundRouteTarget, analyze_inbound_route};
@@ -42,6 +42,7 @@ use ai_protocol::control::{
     StreamBinding, SubmitPostCallJob,
 };
 use ai_protocol::id::{ConversationId, JobId, OperationId, ParticipantId, StreamId, TenantId};
+use ai_protocol::media::MediaFrame;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -184,6 +185,8 @@ impl SessionActor {
                     recording_requested: false,
                     recording_policy_ids: Arc::from([]),
                     ai_policy: None,
+                    ai_agent_revision: Some(agent.revision),
+                    ai_fallback_target: agent.fallback_target.clone(),
                 }],
                 outbound_route_id: None,
                 outbound_route_name: None,
@@ -273,6 +276,8 @@ impl SessionActor {
                                 recording_requested: false,
                                 recording_policy_ids: Arc::from([]),
                                 ai_policy: None,
+                                ai_agent_revision: None,
+                                ai_fallback_target: None,
                             }
                         })
                         .collect();
@@ -282,6 +287,35 @@ impl SessionActor {
                         candidates,
                         outbound_route_id: Some(route.route_id),
                         outbound_route_name: Some(route.route_name),
+                    }
+                }
+                RouteResult::BusinessModule(route) if route.module == "ai_agent" => {
+                    let Some(agent) = domain
+                        .ai_agents
+                        .iter()
+                        .find(|agent| agent.enabled && agent.agent_id == route.target_id)
+                    else {
+                        reject_inbound(&writer, &event, 404).await?;
+                        return Ok(None);
+                    };
+                    ResolvedRoute {
+                        signaling_caller_number: route.transformed_caller,
+                        signaling_callee_number: agent.service_number.clone(),
+                        candidates: vec![OutboundCandidate {
+                            outbound_target: OutboundTarget::AiAgent {
+                                agent_id: agent.agent_id.clone(),
+                            },
+                            callee_route_target: None,
+                            outbound_trunk_ref: None,
+                            outbound_trunk_name: None,
+                            recording_requested: false,
+                            recording_policy_ids: Arc::from([]),
+                            ai_policy: None,
+                            ai_agent_revision: Some(agent.revision),
+                            ai_fallback_target: agent.fallback_target.clone(),
+                        }],
+                        outbound_route_id: None,
+                        outbound_route_name: None,
                     }
                 }
                 RouteResult::CalleeSet(_) | RouteResult::BusinessModule(_) => {
@@ -387,7 +421,7 @@ impl SessionActor {
                 .find(|agent| agent.agent_id == *agent_id)
                 .map(|agent| agent.profile_id.clone());
             if let Some(profile_id) = profile_id
-                && let Some(profile) = ai_jobs.profile_snapshot(&profile_id)
+                && let Some(profile) = ai_jobs.executable_voice_agent_profile(&profile_id)
             {
                 let request = StartConversation {
                     conversation: JobRef {
@@ -412,8 +446,62 @@ impl SessionActor {
                         channels: 1,
                     },
                 };
-                if let Err(error) = ai_jobs.try_start_conversation(request) {
+                let conversation = request.conversation.clone();
+                let tap = AiMediaTapSpec {
+                    job: conversation.clone(),
+                    caller: AiTapStreamSpec {
+                        participant_id: ParticipantId::new("caller")?,
+                        stream_id: StreamId::new("caller-audio")?,
+                        payload_type: 8,
+                        codec: AudioCodec::Pcma,
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                    // AI agent calls have no SIP callee.  This placeholder is never selected for
+                    // a valid AI leg but preserves the common bounded media-tap representation.
+                    callee: AiTapStreamSpec {
+                        participant_id: ParticipantId::new("ai-agent")?,
+                        stream_id: StreamId::new("ai-agent-audio")?,
+                        payload_type: 8,
+                        codec: AudioCodec::Pcma,
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                };
+                if let Err(error) =
+                    ai_jobs.try_start_voice_agent(request, media_handle.clone(), tap)
+                {
                     warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
+                } else {
+                    record_ai_agent_trace(
+                        &state,
+                        &call_id,
+                        &event.domain_id,
+                        &event.adapter_call_leg_id,
+                        &caller_session_id,
+                        "conversation_started",
+                        conversation.generation,
+                        json!({
+                            "agent_id": agent_id,
+                            "agent_revision": domain.ai_agents.iter().find(|agent| agent.agent_id == *agent_id).map(|agent| agent.revision),
+                            "round": 0,
+                        }),
+                    );
+                    spawn_ai_agent_playback(
+                        ai_jobs.subscribe_media(),
+                        ai_jobs.subscribe_control(),
+                        media_handle.clone(),
+                        conversation,
+                        call_id.clone(),
+                        state.clone(),
+                        domain
+                            .ai_agents
+                            .iter()
+                            .find(|agent| agent.agent_id == *agent_id)
+                            .map(|agent| agent.revision),
+                        event.adapter_call_leg_id.clone(),
+                        caller_session_id.clone(),
+                    );
                 }
             }
         }
@@ -432,6 +520,13 @@ impl SessionActor {
         let (caller_handle, control_rx, event_rx) = SessionHandle::new_pair();
         let (coordinator_handle, coordinator_mailbox) =
             CallCoordinatorHandle::new_pair(call_id.clone());
+        if matches!(
+            first_candidate.outbound_target,
+            OutboundTarget::AiAgent { .. }
+        ) && let Some(ai_jobs) = state.ai_jobs()
+        {
+            ai_jobs.register_voice_coordinator(call_id.clone(), coordinator_handle.clone());
+        }
         let (callee_handle, callee_control_rx, callee_event_rx) = SessionHandle::new_pair();
         let action_executor =
             AdapterActionExecutor::new(writer.clone(), control_dispatcher.clone());
@@ -711,7 +806,11 @@ impl SessionActor {
         } else {
             None
         };
-        let ai_capture_requested = self.try_start_ai_capture(&pending.payload_types);
+        let ai_capture_requested = if self.call.callee_target.starts_with("ai_agent:") {
+            false
+        } else {
+            self.try_start_ai_capture(&pending.payload_types)
+        };
         self.media_executor.start_answer_media(
             format!("start-answer-media-{call_id}"),
             self.media_generation,
@@ -840,7 +939,9 @@ impl SessionActor {
                     Err(error) => {
                         let command = match purpose {
                             PrepareSdpPurpose::Provisional { .. } => "CancelOutbound",
-                            PrepareSdpPurpose::Answer { .. } => "HangupDialog",
+                            PrepareSdpPurpose::Answer { .. } | PrepareSdpPurpose::AiAgentAnswer => {
+                                "HangupDialog"
+                            }
                             PrepareSdpPurpose::CalleeAttemptOffer { attempt_seq } => {
                                 self.handle_attempt_offer_prepared(attempt_seq, Err(error))?;
                                 return Ok(());
@@ -870,6 +971,9 @@ impl SessionActor {
                     }
                     PrepareSdpPurpose::Answer { payload_types } => {
                         self.complete_answer(prepared, payload_types)?;
+                    }
+                    PrepareSdpPurpose::AiAgentAnswer => {
+                        self.complete_answer(prepared, Vec::new())?;
                     }
                     PrepareSdpPurpose::CalleeAttemptOffer { attempt_seq } => {
                         self.handle_attempt_offer_prepared(attempt_seq, Ok(prepared))?;
@@ -993,22 +1097,20 @@ impl SessionActor {
         if should_signal_peer {
             self.call.begin_terminating(HangupCause::InternalError);
             self.cancel_timer(CallTimerKind::Ring);
-            let (command, action_id) = if self.call.is_answered() {
-                (
-                    "HangupDialog",
-                    format!("hangup-after-cancel-{}", self.call.call_id()),
-                )
+            if self.call.callee_target.starts_with("ai_agent:") {
+                self.call.callee_terminated = true;
             } else {
-                ("CancelOutbound", format!("cancel-{}", self.call.call_id()))
-            };
-            self.submit_callee_action(
-                command,
-                action_id,
-                json!({
-                    "reason": "caller_cancelled",
-                }),
-            )?;
-            start_cleanup_timer = true;
+                let (command, action_id) = if self.call.is_answered() {
+                    (
+                        "HangupDialog",
+                        format!("hangup-after-cancel-{}", self.call.call_id()),
+                    )
+                } else {
+                    ("CancelOutbound", format!("cancel-{}", self.call.call_id()))
+                };
+                self.submit_callee_action(command, action_id, json!({}))?;
+                start_cleanup_timer = true;
+            }
         }
         if self.call.caller_terminated && self.call.callee_terminated {
             self.begin_finish_call();
@@ -1046,7 +1148,15 @@ impl SessionActor {
             let peer_is_callee = session_id == Some(self.call.caller_session_id());
             let call_id = self.call.call_id().to_string();
             if peer_is_callee {
-                self.submit_callee_action("HangupDialog", format!("hangup-{call_id}"), json!({}))?;
+                if self.call.callee_target.starts_with("ai_agent:") {
+                    self.call.callee_terminated = true;
+                } else {
+                    self.submit_callee_action(
+                        "HangupDialog",
+                        format!("hangup-{call_id}"),
+                        json!({}),
+                    )?;
+                }
             } else {
                 self.submit_caller_action("HangupDialog", format!("hangup-{call_id}"), json!({}))?;
             }
@@ -1092,6 +1202,8 @@ fn endpoint_resolved_route(
             recording_requested: false,
             recording_policy_ids: Arc::from([]),
             ai_policy: None,
+            ai_agent_revision: None,
+            ai_fallback_target: None,
         }],
         outbound_route_id: None,
         outbound_route_name: None,
@@ -1149,6 +1261,10 @@ fn ai_policy_for_candidate(
     outbound_target: &OutboundTarget,
 ) -> Option<AiPolicyDecisionSnapshot> {
     use crate::pbx::recording::model::RecordingTargetType;
+
+    if matches!(outbound_target, OutboundTarget::AiAgent { .. }) {
+        return None;
+    }
 
     let outbound_trunk_ref = match outbound_target {
         OutboundTarget::Trunk { trunk_ref } => Some(trunk_ref.as_str()),
@@ -1286,6 +1402,194 @@ fn build_ai_submission(
         },
     };
     Ok((request, tap))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_ai_agent_playback(
+    mut inbound: tokio::sync::broadcast::Receiver<MediaFrame>,
+    mut controls: tokio::sync::broadcast::Receiver<ai_protocol::control::ControlEnvelope>,
+    media: crate::runtime::media::MediaBridgeHandle,
+    conversation: JobRef,
+    call_id: String,
+    state: AppState,
+    agent_revision: Option<u64>,
+    adapter_call_leg_id: String,
+    session_id: String,
+) {
+    tokio::spawn(async move {
+        let mut playback = match TtsPlayback::new(conversation.generation) {
+            Ok(playback) => playback,
+            Err(error) => {
+                warn!(call_id, error = %error, "AI Agent TTS playback initialization failed");
+                return;
+            }
+        };
+        let mut playback_generation = conversation.generation;
+        let mut traced_tts_generation = None;
+        let mut rtp_sequence = 1_u16;
+        let ssrc = call_id.bytes().fold(0x4150_4258_u32, |value, byte| {
+            value.rotate_left(5) ^ u32::from(byte)
+        });
+        loop {
+            let frame = loop {
+                tokio::select! {
+                    result = inbound.recv() => match result {
+                        Ok(frame) => break frame,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            warn!(call_id, count, "AI Agent TTS media lagged; stale frames dropped");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                    result = controls.recv() => match result {
+                        Ok(envelope) => {
+                            if let ai_protocol::control::ControlMessage::TtsStateChanged(tts_state) = envelope.message
+                                && tts_state.conversation.conversation_id == conversation.conversation_id
+                                && tts_state.conversation.job_id == conversation.job_id
+                                && tts_state.conversation.tenant_id == conversation.tenant_id
+                                && tts_state.generation >= playback_generation
+                            {
+                                if tts_state.state == ai_protocol::control::TtsState::Interrupted {
+                                    record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_interrupted", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
+                                    if let Err(error) = playback.interrupt(tts_state.generation) {
+                                        warn!(call_id, error = %error, "AI Agent TTS interruption rejected");
+                                    } else {
+                                        playback_generation = tts_state.generation;
+                                    }
+                                } else if tts_state.state == ai_protocol::control::TtsState::Stopped {
+                                    record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_stopped", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            warn!(call_id, count, "AI Agent control events lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if media.is_stopped() { return; }
+                    }
+                }
+            };
+            if frame.metadata.conversation_id != conversation.conversation_id
+                || frame.metadata.job_id != conversation.job_id
+                || frame.metadata.tenant_id != conversation.tenant_id
+                || frame.metadata.direction != MediaDirection::ToParticipant
+            {
+                continue;
+            }
+            if frame.metadata.codec != AudioCodec::Pcm16Le
+                || frame.metadata.sample_rate != 16_000
+                || frame.metadata.channels != 1
+            {
+                warn!(call_id, "AI Agent returned unsupported TTS media format");
+                continue;
+            }
+            if frame.metadata.generation < playback_generation {
+                continue;
+            }
+            if frame.metadata.generation > playback_generation {
+                if let Err(error) = playback.interrupt(frame.metadata.generation) {
+                    warn!(call_id, error = %error, "AI Agent TTS generation update rejected");
+                    continue;
+                }
+                playback_generation = frame.metadata.generation;
+            }
+            let frames = match playback.packetize(&frame.payload, PlaybackCodec::Pcma) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    warn!(call_id, error = %error, "AI Agent TTS packetization failed");
+                    continue;
+                }
+            };
+            if traced_tts_generation != Some(frame.metadata.generation) {
+                record_ai_agent_trace(
+                    &state,
+                    &call_id,
+                    conversation.tenant_id.as_str(),
+                    &adapter_call_leg_id,
+                    &session_id,
+                    "tts_started",
+                    frame.metadata.generation,
+                    json!({"agent_revision": agent_revision, "round": frame.metadata.generation, "pcm_bytes": frame.payload.len()}),
+                );
+                traced_tts_generation = Some(frame.metadata.generation);
+            }
+            for packet in frames {
+                if media.is_stopped() || packet.generation != playback_generation {
+                    break;
+                }
+                if let Err(error) = media
+                    .send_tts_rtp(&packet.payload, 8, packet.timestamp, rtp_sequence, ssrc)
+                    .await
+                {
+                    warn!(call_id, error = %error, "AI Agent TTS RTP playback stopped");
+                    return;
+                }
+                rtp_sequence = rtp_sequence.wrapping_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    result = controls.recv() => match result {
+                        Ok(envelope) => {
+                            if let ai_protocol::control::ControlMessage::TtsStateChanged(tts_state) = envelope.message
+                                && tts_state.conversation.conversation_id == conversation.conversation_id
+                                && tts_state.conversation.job_id == conversation.job_id
+                                && tts_state.conversation.tenant_id == conversation.tenant_id
+                                && tts_state.generation >= playback_generation
+                            {
+                                if tts_state.state == ai_protocol::control::TtsState::Interrupted {
+                                    record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_interrupted", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
+                                    if let Err(error) = playback.interrupt(tts_state.generation) {
+                                        warn!(call_id, error = %error, "AI Agent TTS interruption rejected");
+                                    } else {
+                                        playback_generation = tts_state.generation;
+                                    }
+                                } else if tts_state.state == ai_protocol::control::TtsState::Stopped {
+                                    record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_stopped", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
+                                }
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            warn!(call_id, count, "AI Agent control events lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ai_agent_trace(
+    state: &AppState,
+    call_id: &str,
+    domain_id: &str,
+    adapter_call_leg_id: &str,
+    session_id: &str,
+    event: &str,
+    generation: u64,
+    details: serde_json::Value,
+) {
+    let now = unix_timestamp_ms();
+    state.record_call_trace(crate::data_store::CallTraceMessage {
+        call_id: call_id.to_string(),
+        domain_id: domain_id.to_string(),
+        sequence: now,
+        observed_at_ms: now,
+        direction: "ai-agent".to_string(),
+        adapter_call_leg_id: adapter_call_leg_id.to_string(),
+        session_id: Some(session_id.to_string()),
+        source_addr: None,
+        destination_addr: None,
+        start_line: format!("AI {event}"),
+        packet: serde_json::json!({
+            "event": event,
+            "generation": generation,
+            "details": details,
+        })
+        .to_string(),
+    });
 }
 
 fn trunk_display_name(
@@ -1517,6 +1821,8 @@ mod tests {
             recording_requested: true,
             recording_policy_ids: Arc::from([41_u64]),
             ai_policy: None,
+            ai_agent_revision: None,
+            ai_fallback_target: Some("end_call".to_string()),
         };
         let frozen_recording_dir = PathBuf::from("/tmp/voipswitch-recordings-v7");
         let frozen_timeouts = CallTimeouts {
@@ -1566,6 +1872,7 @@ mod tests {
             100,
         )
         .unwrap();
+        assert_eq!(call.ai_fallback_target.as_deref(), Some("end_call"));
 
         // Simulate a global reload before the 200 response is acknowledged.
         let latest_recording_dir = PathBuf::from("/tmp/voipswitch-recordings-v8");

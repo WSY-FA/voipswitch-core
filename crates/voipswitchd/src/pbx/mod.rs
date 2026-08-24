@@ -72,6 +72,7 @@ pub fn init_modules(
     api_commands: &ApiCommandRegistry,
 ) {
     let mut vc_config_tables = vc_config::VcConfigTableRegistry::default();
+    let ai_agent_state = state.clone();
     let mut ctx = PbxModuleInitContext {
         state,
         analysis,
@@ -81,6 +82,9 @@ pub fn init_modules(
     for module in PBX_MODULES {
         (module.init)(&mut ctx);
     }
+    drop(ctx);
+    ai_agent::register_vc_config_table(&mut vc_config_tables);
+    ai_agent::register_analysis(analysis, ai_agent_state);
     sip::register_vc_config_tables(&mut vc_config_tables);
     global_setting::register_vc_config_table(&mut vc_config_tables);
     sip::register_config_commands(config_commands);

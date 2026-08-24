@@ -355,6 +355,7 @@ mod tests {
                 key_points: Vec::new(),
                 action_items: Vec::new(),
                 tags: Vec::new(),
+                action: None,
             },
         }
     }

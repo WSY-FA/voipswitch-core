@@ -6,8 +6,9 @@ use super::{
 use crate::data_store::{AiCallResultRecord, ConfigBackend};
 use crate::runtime::media::MediaBridgeHandle;
 use ai_protocol::control::{
-    ControlMessage, JobResultRequest, JobState, StartConversation, SubmitPostCallJob,
+    ActionResult, ControlMessage, JobResultRequest, JobState, StartConversation, SubmitPostCallJob,
 };
+use ai_protocol::media::MediaFrame;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,17 +43,43 @@ pub(crate) struct AiJobService {
     tx: mpsc::Sender<JobCommand>,
     active_conversations: Arc<Mutex<BTreeSet<String>>>,
     connector: AiConnector,
+    voice_coordinators:
+        Arc<Mutex<BTreeMap<String, crate::runtime::call::session::CallCoordinatorHandle>>>,
 }
 
 impl AiJobService {
     pub(crate) fn spawn(backend: Arc<dyn ConfigBackend>, connector: AiConnector) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let voice_coordinators = Arc::new(Mutex::new(BTreeMap::new()));
         tokio::spawn(run(backend, connector.clone(), rx));
+        tokio::spawn(run_action_router(
+            connector.clone(),
+            voice_coordinators.clone(),
+        ));
         Self {
             tx,
             active_conversations: Arc::new(Mutex::new(BTreeSet::new())),
             connector,
+            voice_coordinators,
         }
+    }
+
+    pub(crate) fn register_voice_coordinator(
+        &self,
+        call_id: String,
+        handle: crate::runtime::call::session::CallCoordinatorHandle,
+    ) {
+        self.voice_coordinators
+            .lock()
+            .expect("AI coordinator map lock poisoned")
+            .insert(call_id, handle);
+    }
+
+    pub(crate) fn unregister_voice_coordinator(&self, call_id: &str) {
+        self.voice_coordinators
+            .lock()
+            .expect("AI coordinator map lock poisoned")
+            .remove(call_id);
     }
 
     pub(crate) fn executable_profile(
@@ -76,20 +103,42 @@ impl AiJobService {
         self.connector.profile_catalog()
     }
 
-    pub(crate) fn profile_snapshot(
+    pub(crate) fn executable_voice_agent_profile(
         &self,
         profile_id: &str,
     ) -> Option<ai_protocol::control::AiProfileSnapshot> {
-        self.connector
-            .profile_catalog()?
-            .profiles
-            .into_iter()
-            .find(|projection| projection.profile.profile_id.as_str() == profile_id)
-            .map(|projection| projection.profile)
+        self.connector.executable_voice_agent_profile(profile_id)
     }
 
-    pub(crate) fn try_start_conversation(&self, request: StartConversation) -> Result<()> {
-        self.connector.try_start_conversation(request)
+    pub(crate) fn try_start_voice_agent(
+        &self,
+        request: StartConversation,
+        media: MediaBridgeHandle,
+        tap: AiMediaTapSpec,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            request.conversation == tap.job,
+            "voice-agent tap identity mismatch"
+        );
+        self.connector.try_start_conversation(request)?;
+        media.enable_ai_tap(AiMediaTapSender::new(self.connector.clone(), tap))
+    }
+
+    pub(crate) fn subscribe_media(&self) -> tokio::sync::broadcast::Receiver<MediaFrame> {
+        self.connector.subscribe_media()
+    }
+
+    pub(crate) fn subscribe_control(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ai_protocol::control::ControlEnvelope> {
+        self.connector.subscribe()
+    }
+
+    pub(crate) fn try_send_action_result(
+        &self,
+        result: ai_protocol::control::ActionResult,
+    ) -> Result<()> {
+        self.connector.try_send_action_result(result)
     }
 
     pub(crate) fn try_submit(
@@ -157,6 +206,84 @@ impl AiJobService {
             ));
         }
         Ok(())
+    }
+}
+
+async fn run_action_router(
+    connector: AiConnector,
+    coordinators: Arc<
+        Mutex<BTreeMap<String, crate::runtime::call::session::CallCoordinatorHandle>>,
+    >,
+) {
+    let mut events = connector.subscribe();
+    let mut connection = connector.subscribe_connection();
+    loop {
+        let envelope = tokio::select! {
+            result = events.recv() => match result {
+                Ok(envelope) => envelope,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    warn!(count, "AI action router lagged; stale action requests dropped");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            changed = connection.changed() => {
+                if changed.is_err() { return; }
+                if !*connection.borrow() {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if !connector.is_control_connected() {
+                        let handles = coordinators
+                            .lock()
+                            .expect("AI coordinator map lock poisoned")
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for handle in handles {
+                            let _ = handle.control_sender().try_send(
+                                crate::runtime::call::session::ControlMessage::AiGatewayUnavailable,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        let ControlMessage::ActionRequested(request) = envelope.message else {
+            continue;
+        };
+        let call_id = request.conversation.conversation_id.to_string();
+        let handle = coordinators
+            .lock()
+            .expect("AI coordinator map lock poisoned")
+            .get(&call_id)
+            .cloned();
+        let Some(handle) = handle else {
+            let _ = connector.try_send_action_result(ActionResult {
+                conversation: request.conversation,
+                operation_id: request.operation_id,
+                generation: request.generation,
+                success: false,
+                code: "CALL_NOT_FOUND".to_string(),
+                message: Some("AI call coordinator is no longer active".to_string()),
+            });
+            continue;
+        };
+        if handle
+            .control_sender()
+            .try_send(
+                crate::runtime::call::session::ControlMessage::AiActionRequested(request.clone()),
+            )
+            .is_err()
+        {
+            let _ = connector.try_send_action_result(ActionResult {
+                conversation: request.conversation,
+                operation_id: request.operation_id,
+                generation: request.generation,
+                success: false,
+                code: "CORE_QUEUE_UNAVAILABLE".to_string(),
+                message: Some("AI call coordinator mailbox is unavailable".to_string()),
+            });
+        }
     }
 }
 
@@ -594,6 +721,7 @@ mod tests {
                     key_points: Vec::new(),
                     action_items: Vec::new(),
                     tags: Vec::new(),
+                    action: None,
                 },
             })
             .unwrap();

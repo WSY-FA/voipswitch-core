@@ -704,6 +704,10 @@ impl MediaBridge {
 }
 
 impl MediaBridgeHandle {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn send_tts_rtp(
         &self,
@@ -1024,6 +1028,21 @@ impl MediaBridgeHandle {
     }
 
     pub async fn prepare_caller_sdp(&self, answer: &SdpBody, generation: u64) -> Result<SdpBody> {
+        self.prepare_caller_sdp_internal(answer, generation, true)
+            .await
+    }
+
+    pub async fn prepare_ai_agent_sdp(&self, offer: &SdpBody, generation: u64) -> Result<SdpBody> {
+        self.prepare_caller_sdp_internal(offer, generation, false)
+            .await
+    }
+
+    async fn prepare_caller_sdp_internal(
+        &self,
+        answer: &SdpBody,
+        generation: u64,
+        update_callee_remote: bool,
+    ) -> Result<SdpBody> {
         let relay = RelayEndpoint {
             rtp: SocketAddr::new(
                 self.caller_advertise_ip,
@@ -1036,15 +1055,28 @@ impl MediaBridgeHandle {
         };
         let prepared =
             rewrite_audio_sdp(answer, relay).context("rewrite callee answer for caller")?;
-        *self.callee_remote_rtp.write().await = Some(prepared.parsed.remote_rtp);
-        *self.callee_remote_rtcp.write().await = prepared.parsed.remote_rtcp;
+        if update_callee_remote {
+            *self.callee_remote_rtp.write().await = Some(prepared.parsed.remote_rtp);
+            *self.callee_remote_rtcp.write().await = prepared.parsed.remote_rtcp;
+        } else {
+            *self.callee_remote_rtp.write().await = None;
+            *self.callee_remote_rtcp.write().await = None;
+        }
         let telephone_event = prepared.parsed.telephone_event;
         update_dtmf_negotiation(
             &self.caller_dtmf_config,
             telephone_event.clone(),
             generation,
         );
-        update_dtmf_negotiation(&self.callee_dtmf_config, telephone_event, generation);
+        update_dtmf_negotiation(
+            &self.callee_dtmf_config,
+            if update_callee_remote {
+                telephone_event
+            } else {
+                None
+            },
+            generation,
+        );
         Ok(prepared.body)
     }
 
@@ -1546,6 +1578,15 @@ fn spawn_relay(spec: RelayTaskSpec, mut stop_rx: watch::Receiver<bool>) -> JoinH
                     {
                         continue;
                     }
+                    if let Some((tap, side)) = &spec.ai_tap
+                        && let Some(sender) = tap
+                            .read()
+                            .expect("AI tap lock poisoned")
+                            .as_ref()
+                            .cloned()
+                    {
+                        sender.tap(*side, &packet[..size]);
+                    }
                     let remote = *spec.target.read().await;
                     let Some(remote) = remote else {
                         continue;
@@ -1558,15 +1599,6 @@ fn spawn_relay(spec: RelayTaskSpec, mut stop_rx: watch::Receiver<bool>) -> JoinH
                             .cloned()
                     {
                         sender.tap(*side, &packet[..size], std::time::Instant::now());
-                    }
-                    if let Some((tap, side)) = &spec.ai_tap
-                        && let Some(sender) = tap
-                            .read()
-                            .expect("AI tap lock poisoned")
-                            .as_ref()
-                            .cloned()
-                    {
-                        sender.tap(*side, &packet[..size]);
                     }
                     if spec.send_socket.send_to(&packet[..size], remote).await.is_ok() {
                         count_packet(&spec.counters, spec.direction, size as u64);
@@ -2552,6 +2584,32 @@ mod tests {
         assert_eq!(*handle.callee_remote_rtcp.read().await, None);
 
         bridge.stop("call-attempt-switch").await;
+    }
+
+    #[tokio::test]
+    async fn ai_agent_answer_does_not_loop_caller_rtp_back_to_caller() {
+        let (bridge, _) = MediaBridge::allocate_userspace(
+            &audio_sdp(30000, 30001),
+            Some("127.0.0.1:15060".parse().unwrap()),
+            None,
+            Arc::new(UnavailableFastPathController),
+        )
+        .await
+        .unwrap();
+        let handle = bridge.handle();
+
+        handle
+            .prepare_ai_agent_sdp(&audio_sdp(31000, 31001), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.caller_remote().await,
+            Some("127.0.0.1:30000".parse().unwrap())
+        );
+        assert_eq!(handle.callee_remote().await, None);
+
+        bridge.stop("ai-agent-no-echo").await;
     }
 
     #[test]

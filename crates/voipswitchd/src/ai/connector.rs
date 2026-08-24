@@ -5,7 +5,7 @@ use ai_protocol::control::{
 };
 use ai_protocol::frame::{read_json_frame, write_json_frame};
 use ai_protocol::id::{ConnectorInstanceId, MessageId};
-use ai_protocol::media::{MediaFrame, write_media_frame};
+use ai_protocol::media::{MediaFrame, read_media_frame, write_media_frame};
 use ai_protocol::time::unix_timestamp_ms;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -52,6 +52,7 @@ struct ConnectorMetrics {
 pub(crate) struct AiConnector {
     control_tx: mpsc::Sender<ControlEnvelope>,
     media_tx: mpsc::Sender<MediaFrame>,
+    media_events: broadcast::Sender<MediaFrame>,
     events: broadcast::Sender<ControlEnvelope>,
     connected: watch::Receiver<bool>,
     profile_catalog: watch::Receiver<Option<ProfileCatalogSnapshot>>,
@@ -64,6 +65,7 @@ impl AiConnector {
         let connector_instance_id = ConnectorInstanceId::new(config.instance_id.clone())?;
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let (media_tx, media_rx) = mpsc::channel(MEDIA_QUEUE_CAPACITY);
+        let (media_events, _) = broadcast::channel(MEDIA_QUEUE_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_QUEUE_CAPACITY);
         let (connected_tx, connected) = watch::channel(false);
         let (profile_catalog_tx, profile_catalog) = watch::channel(None);
@@ -83,12 +85,14 @@ impl AiConnector {
         tokio::spawn(run_media_connection(
             config.media_socket,
             media_rx,
+            media_events.clone(),
             metrics.clone(),
         ));
 
         Ok(Self {
             control_tx,
             media_tx,
+            media_events,
             events,
             connected,
             profile_catalog,
@@ -105,6 +109,10 @@ impl AiConnector {
         *self.connected.borrow()
     }
 
+    pub(crate) fn subscribe_connection(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
+    }
+
     pub(crate) fn executable_profile(&self, profile_id: &str) -> Option<AiProfileSnapshot> {
         if !self.is_control_connected() {
             return None;
@@ -117,6 +125,27 @@ impl AiConnector {
             .find(|projection| {
                 projection.profile.profile_id.as_str() == profile_id
                     && projection.profile.pipeline_type == AiPipelineType::PostCallAnalysis
+                    && projection.enabled
+                    && projection.executable
+            })
+            .map(|projection| projection.profile.clone())
+    }
+
+    pub(crate) fn executable_voice_agent_profile(
+        &self,
+        profile_id: &str,
+    ) -> Option<AiProfileSnapshot> {
+        if !self.is_control_connected() {
+            return None;
+        }
+        self.profile_catalog
+            .borrow()
+            .as_ref()?
+            .profiles
+            .iter()
+            .find(|projection| {
+                projection.profile.profile_id.as_str() == profile_id
+                    && projection.profile.pipeline_type == AiPipelineType::VoiceAgent
                     && projection.enabled
                     && projection.executable
             })
@@ -157,6 +186,13 @@ impl AiConnector {
         self.try_send(ControlMessage::StartConversation(request))
     }
 
+    pub(crate) fn try_send_action_result(
+        &self,
+        result: ai_protocol::control::ActionResult,
+    ) -> Result<()> {
+        self.try_send(ControlMessage::ActionResult(result))
+    }
+
     pub(crate) fn try_send_media(&self, frame: MediaFrame) -> bool {
         match self.media_tx.try_send(frame) {
             Ok(()) => true,
@@ -167,6 +203,10 @@ impl AiConnector {
                 false
             }
         }
+    }
+
+    pub(crate) fn subscribe_media(&self) -> broadcast::Receiver<MediaFrame> {
+        self.media_events.subscribe()
     }
 
     pub(crate) fn metrics(&self) -> ConnectorMetricsSnapshot {
@@ -331,20 +371,38 @@ async fn connect_control(
 async fn run_media_connection(
     socket: PathBuf,
     mut outbound: mpsc::Receiver<MediaFrame>,
+    events: broadcast::Sender<MediaFrame>,
     metrics: Arc<ConnectorMetrics>,
 ) {
     let mut delay = RECONNECT_MIN_DELAY;
     loop {
         match UnixStream::connect(&socket).await {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 delay = RECONNECT_MIN_DELAY;
                 metrics.media_connected.store(true, Ordering::Release);
                 info!(socket = %socket.display(), "AI media connector ready");
-                while let Some(frame) = outbound.recv().await {
-                    if let Err(error) = write_media_frame(&mut stream, &frame).await {
-                        metrics.media_write_failed.fetch_add(1, Ordering::Relaxed);
-                        debug!(error = %error, "AI media connection closed");
-                        break;
+                let (mut reader, mut writer) = stream.into_split();
+                loop {
+                    tokio::select! {
+                        outbound_frame = outbound.recv() => {
+                            let Some(frame) = outbound_frame else { return; };
+                            if let Err(error) = write_media_frame(&mut writer, &frame).await {
+                                metrics.media_write_failed.fetch_add(1, Ordering::Relaxed);
+                                debug!(error = %error, "AI media connection closed");
+                                break;
+                            }
+                        }
+                        inbound_frame = read_media_frame(&mut reader) => {
+                            match inbound_frame {
+                                Ok(frame) => {
+                                    let _ = events.send(frame);
+                                }
+                                Err(error) => {
+                                    debug!(error = %error, "AI media connection closed");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }

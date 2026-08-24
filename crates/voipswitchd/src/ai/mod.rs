@@ -8,3 +8,4 @@ pub(crate) use connector::{AiConnector, AiConnectorConfig};
 pub(crate) use job_service::AiJobService;
 pub(crate) use media_tap::{AiCaptureFinalized, AiMediaTapSender, AiMediaTapSpec, AiTapStreamSpec};
 pub(crate) use outbox::{AiSubmissionOutbox, OutboxState};
+pub(crate) use tts_playback::{PlaybackCodec, TtsPlayback};

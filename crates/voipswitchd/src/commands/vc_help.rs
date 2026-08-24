@@ -23,7 +23,7 @@ impl ApiCommandHandler for VcHelpApiCommand {
                 "  vc config delete <table> [--domain <domain>] [--cond <field=value|any>]".to_string(),
                 "  vc config batch_insert <table> [--domain <domain>] --file <path>".to_string(),
                 "".to_string(),
-                "config tables: global_setting, domain, ext, peer_trunk, reg_trunk, reg_account, inbound_route, outbound_route, recording_policy, ai_policy".to_string(),
+                "config tables: global_setting, domain, ext, peer_trunk, reg_trunk, reg_account, inbound_route, outbound_route, recording_policy, ai_policy, ai_agent".to_string(),
                 "status tables: ext_status, siptrk_status (select only)".to_string(),
                 "".to_string(),
                 "examples:".to_string(),
@@ -48,6 +48,7 @@ impl ApiCommandHandler for VcHelpApiCommand {
                 "  vc config delete inbound_route --domain domain-xxx --cond id=1".to_string(),
                 "  vc config insert recording_policy --domain domain-xxx name=record-1001 target_type=extension target_id=1 direction=both priority=100 enabled=true".to_string(),
                 "  vc config insert ai_policy --domain domain-xxx name=ai-1001 target_refs=ext:1 direction=any priority=100 ai_profile_id=profile-1 enabled=true".to_string(),
+                "  vc config insert ai_agent --domain domain-xxx agent_id=operator name=Operator service_number=8000 profile_id=voice-profile enabled=true".to_string(),
             ],
         ))
     }

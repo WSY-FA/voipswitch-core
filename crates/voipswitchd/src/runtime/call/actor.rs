@@ -1,4 +1,5 @@
 use crate::app::AppState;
+use crate::data_store::CallTraceMessage;
 use crate::runtime::call::action::AdapterActionExecutor;
 use crate::runtime::call::attempt::AttemptRegistrar;
 use crate::runtime::call::dtmf::{
@@ -16,17 +17,20 @@ use crate::runtime::call::session::{
     CriticalControlDispatcher, EventMessage,
 };
 use crate::runtime::call::timer::{CallTimerKind, CallTimerSlot, wait_for_timer};
+use ai_protocol::control::{ActionRequested, ActionResult, AgentAction};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
-use voipswitch_core::dtmf::{DigitEvent, DtmfEventId, DtmfTransport};
+use voipswitch_core::dtmf::{DigitEvent, DtmfDigit, DtmfEventId, DtmfTransport};
 use voipswitch_core::media::SdpBody;
 use voipswitch_core::session::Session;
 use voipswitch_core::types::call::{CallState, HangupCause, LegState};
+use voipswitch_core::types::time::unix_timestamp_ms;
 
 pub(crate) struct InitialCallAction {
     pub(crate) callee: bool,
@@ -279,9 +283,7 @@ impl SessionActor {
                 if let Err(error) = self.media_executor.prepare_sdp(
                     format!("prepare-ai-agent-answer-{}", self.call.call_id()),
                     self.media_generation,
-                    crate::runtime::call::media_action::PrepareSdpPurpose::Answer {
-                        payload_types: Vec::new(),
-                    },
+                    crate::runtime::call::media_action::PrepareSdpPurpose::AiAgentAnswer,
                     self.caller_offer.clone(),
                 ) {
                     warn!(call_id = self.call.call_id(), error = %error, "AI Agent media answer preparation failed");
@@ -433,6 +435,8 @@ impl SessionActor {
             ControlMessage::AttemptRegistrationResult(result) => {
                 self.handle_attempt_registration_result(result)
             }
+            ControlMessage::AiActionRequested(request) => self.handle_ai_action(request),
+            ControlMessage::AiGatewayUnavailable => self.handle_ai_gateway_unavailable(),
             ControlMessage::PrepareCoordinatorHandoff { .. }
             | ControlMessage::PrepareCoordinatorTarget { .. } => {
                 warn!(
@@ -485,6 +489,265 @@ impl SessionActor {
             return true;
         }
         true
+    }
+
+    fn handle_ai_action(&mut self, request: ActionRequested) -> Result<()> {
+        let conversation = request.conversation.clone();
+        let operation_id = request.operation_id.clone();
+        let generation = request.generation;
+        let action_kind = match &request.action {
+            AgentAction::PlayText { .. } => "play_text",
+            AgentAction::CollectDigits { .. } => "collect_digits",
+            AgentAction::TransferToExtension { .. } => "transfer_to_extension",
+            AgentAction::TransferToBusinessTarget { .. } => "transfer_to_business_target",
+            AgentAction::EndCall { .. } => "end_call",
+        };
+        let result = self.validate_ai_action(&request).and_then(|_| {
+            let key = (format!("ai:{operation_id}"), generation);
+            if !self.runtime.completed_actions.insert(key) {
+                return Ok((true, "IDEMPOTENT_REPLAY".to_string(), None));
+            }
+            match request.action {
+                AgentAction::EndCall { reason } => {
+                    self.call.begin_terminating(HangupCause::NormalClearing);
+                    self.call.hangup_cause = Some(HangupCause::NormalClearing);
+                    self.call.state = CallState::Terminating;
+                    self.call.callee_terminated = true;
+                    self.cancel_timer(CallTimerKind::Dial);
+                    self.cancel_timer(CallTimerKind::Ring);
+                    self.submit_caller_action(
+                        "HangupDialog",
+                        format!("ai-end-call-{}", self.call.call_id()),
+                        json!({"reason": reason}),
+                    )?;
+                    self.start_timer(CallTimerKind::Cleanup);
+                    self.publish_call_view();
+                    Ok((true, "ACCEPTED".to_string(), None))
+                }
+                AgentAction::CollectDigits {
+                    max_digits,
+                    timeout_ms,
+                } => {
+                    let timeout_ms = timeout_ms.min(
+                        request
+                            .deadline_at_ms
+                            .saturating_sub(unix_timestamp_ms())
+                            .max(1),
+                    );
+                    let Some(ai_jobs) = self.state.ai_jobs() else {
+                        return Err(anyhow::anyhow!("AI connector is unavailable"));
+                    };
+                    let allowed = HashSet::from([
+                        DtmfDigit::D0,
+                        DtmfDigit::D1,
+                        DtmfDigit::D2,
+                        DtmfDigit::D3,
+                        DtmfDigit::D4,
+                        DtmfDigit::D5,
+                        DtmfDigit::D6,
+                        DtmfDigit::D7,
+                        DtmfDigit::D8,
+                        DtmfDigit::D9,
+                        DtmfDigit::Star,
+                    ]);
+                    let spec = crate::runtime::call::dtmf::DigitCollectionSpec {
+                        collector_id: voipswitch_core::types::ids::CollectorId::from(
+                            operation_id.to_string(),
+                        ),
+                        owner: voipswitch_core::types::ids::BusinessOperationId::from(
+                            operation_id.to_string(),
+                        ),
+                        source_session_id: voipswitch_core::types::ids::SessionId::from(
+                            self.call.caller_session_id().to_string(),
+                        ),
+                        mode: crate::runtime::call::dtmf::DigitCollectionMode::Collect,
+                        allowed,
+                        min_digits: 1,
+                        max_digits: usize::from(max_digits),
+                        terminators: HashSet::from([DtmfDigit::Pound]),
+                        first_digit_timeout: Duration::from_millis(timeout_ms),
+                        inter_digit_timeout: Duration::from_millis(timeout_ms),
+                        overall_timeout: Duration::from_millis(timeout_ms),
+                    };
+                    let receivers = self
+                        .coordinator_handle
+                        .start_digit_collection(spec)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    let connector = ai_jobs.clone();
+                    let result_conversation = conversation.clone();
+                    let result_operation = operation_id.clone();
+                    tokio::spawn(async move {
+                        let ready = receivers.ready.await;
+                        let outcome = receivers.result.await;
+                        let (success, code, message) = match (ready, outcome) {
+                            (Ok(Ok(_)), Ok(outcome)) => {
+                                let digits = dtmf_digits_to_string(&outcome.digits);
+                                let success = matches!(
+                                    outcome.code,
+                                    crate::runtime::call::dtmf::DigitCollectionResultCode::Completed
+                                );
+                                (
+                                    success,
+                                    format!("DTMF_{:?}", outcome.code).to_ascii_uppercase(),
+                                    Some(digits),
+                                )
+                            }
+                            (Ok(Err(error)), _) => {
+                                (false, "DTMF_ACQUIRE_FAILED".to_string(), Some(error))
+                            }
+                            _ => (
+                                false,
+                                "DTMF_RESULT_UNAVAILABLE".to_string(),
+                                Some("digit collector result channel closed".to_string()),
+                            ),
+                        };
+                        let _ = connector.try_send_action_result(ActionResult {
+                            conversation: result_conversation,
+                            operation_id: result_operation,
+                            generation,
+                            success,
+                            code,
+                            message,
+                        });
+                    });
+                    Ok((true, "DEFERRED".to_string(), None))
+                }
+                AgentAction::TransferToExtension { .. }
+                | AgentAction::TransferToBusinessTarget { .. }
+                | AgentAction::PlayText { .. } => Ok((
+                    false,
+                    "ACTION_NOT_AVAILABLE".to_string(),
+                    Some("action requires a later core capability batch".to_string()),
+                )),
+            }
+        });
+        let (success, code, message) = match result {
+            Ok(value) => value,
+            Err(error) => (
+                false,
+                "ACTION_REJECTED".to_string(),
+                Some(error.to_string()),
+            ),
+        };
+        if code != "DEFERRED"
+            && let Some(ai_jobs) = self.state.ai_jobs()
+        {
+            ai_jobs.try_send_action_result(ActionResult {
+                conversation,
+                operation_id: operation_id.clone(),
+                generation,
+                success,
+                code: code.clone(),
+                message,
+            })?;
+        }
+        self.state.record_call_trace(CallTraceMessage {
+            call_id: self.call.call_id().to_string(),
+            domain_id: self.call.domain_id().to_string(),
+            sequence: unix_timestamp_ms(),
+            observed_at_ms: unix_timestamp_ms(),
+            direction: "ai-action".to_string(),
+            adapter_call_leg_id: self.call.caller_adapter_leg_id.as_str().to_string(),
+            session_id: Some(self.call.caller_session_id().to_string()),
+            source_addr: None,
+            destination_addr: None,
+            start_line: format!("AI ActionRequested {action_kind}"),
+            packet: serde_json::json!({
+                "operation_id": operation_id,
+                "generation": generation,
+                "agent_revision": self.call.ai_agent_revision,
+                "action": action_kind,
+                "success": success,
+                "code": code,
+            })
+            .to_string(),
+        });
+        Ok(())
+    }
+
+    fn validate_ai_action(&self, request: &ActionRequested) -> Result<()> {
+        request.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            request.conversation.conversation_id.as_str() == self.call.call_id(),
+            "conversation does not match active call"
+        );
+        anyhow::ensure!(
+            request.conversation.tenant_id.as_str() == self.call.domain_id(),
+            "conversation tenant does not match active domain"
+        );
+        anyhow::ensure!(
+            request.generation == request.conversation.generation,
+            "action generation mismatch"
+        );
+        anyhow::ensure!(
+            request.deadline_at_ms >= unix_timestamp_ms(),
+            "action deadline exceeded"
+        );
+        anyhow::ensure!(
+            self.call.callee_target.starts_with("ai_agent:") && self.call.is_answered(),
+            "AI action is only valid on an answered AI Agent call"
+        );
+        anyhow::ensure!(!self.call.is_terminating(), "call is terminating");
+        Ok(())
+    }
+
+    fn handle_ai_gateway_unavailable(&mut self) -> Result<()> {
+        if !self.call.callee_target.starts_with("ai_agent:") || self.call.is_terminating() {
+            return Ok(());
+        }
+        let fallback_target = self
+            .call
+            .ai_fallback_target
+            .clone()
+            .unwrap_or_else(|| "end_call".to_string());
+        let fallback_mode = if fallback_target == "end_call" {
+            "end_call"
+        } else {
+            // Transfer targets remain disabled until the formal multi-leg transfer topology exists.
+            warn!(
+                call_id = self.call.call_id(),
+                fallback_target = %fallback_target,
+                "AI fallback target is not available; ending call"
+            );
+            "unsupported"
+        };
+        self.call.begin_terminating(HangupCause::TemporaryFailure);
+        self.call.hangup_cause = Some(HangupCause::TemporaryFailure);
+        self.call.state = CallState::Terminating;
+        self.call.callee_terminated = true;
+        self.cancel_timer(CallTimerKind::Dial);
+        self.cancel_timer(CallTimerKind::Ring);
+        self.submit_caller_action(
+            "HangupDialog",
+            format!("ai-gateway-unavailable-{}", self.call.call_id()),
+            json!({"reason": "ai_gateway_unavailable", "fallback": fallback_mode}),
+        )?;
+        self.state.record_call_trace(CallTraceMessage {
+            call_id: self.call.call_id().to_string(),
+            domain_id: self.call.domain_id().to_string(),
+            sequence: unix_timestamp_ms(),
+            observed_at_ms: unix_timestamp_ms(),
+            direction: "ai-agent".to_string(),
+            adapter_call_leg_id: self.call.caller_adapter_leg_id.as_str().to_string(),
+            session_id: Some(self.call.caller_session_id().to_string()),
+            source_addr: None,
+            destination_addr: None,
+            start_line: "AI gateway unavailable fallback".to_string(),
+            packet: json!({
+                "event": "gateway_unavailable_fallback",
+                "fallback_target": fallback_target,
+                "fallback_mode": fallback_mode,
+                "agent_revision": self.call.ai_agent_revision,
+            })
+            .to_string(),
+        });
+        self.start_timer(CallTimerKind::Cleanup);
+        self.publish_call_view();
+        warn!(
+            call_id = self.call.call_id(),
+            "AI gateway unavailable; AI call fallback ended call"
+        );
+        Ok(())
     }
 
     async fn handle_caller_leg_event(
@@ -988,6 +1251,31 @@ pub(crate) struct CalleeSessionActor {
     pub(crate) dtmf_source: DtmfSourceState,
 }
 
+fn dtmf_digits_to_string(digits: &[DtmfDigit]) -> String {
+    digits
+        .iter()
+        .map(|digit| match digit {
+            DtmfDigit::D0 => '0',
+            DtmfDigit::D1 => '1',
+            DtmfDigit::D2 => '2',
+            DtmfDigit::D3 => '3',
+            DtmfDigit::D4 => '4',
+            DtmfDigit::D5 => '5',
+            DtmfDigit::D6 => '6',
+            DtmfDigit::D7 => '7',
+            DtmfDigit::D8 => '8',
+            DtmfDigit::D9 => '9',
+            DtmfDigit::Star => '*',
+            DtmfDigit::Pound => '#',
+            DtmfDigit::A => 'A',
+            DtmfDigit::B => 'B',
+            DtmfDigit::C => 'C',
+            DtmfDigit::D => 'D',
+            DtmfDigit::Flash => 'F',
+        })
+        .collect()
+}
+
 impl CalleeSessionActor {
     fn session_id(&self) -> &str {
         self.session.id.as_str()
@@ -1089,6 +1377,8 @@ impl CalleeSessionActor {
             | ControlMessage::PeerDigitEvent(_)
             | ControlMessage::DtmfInfoSendResult(_)
             | ControlMessage::AttemptRegistrationResult(_)
+            | ControlMessage::AiActionRequested(_)
+            | ControlMessage::AiGatewayUnavailable
             | ControlMessage::CallFinalized => {
                 warn!(
                     call_id = self.call_id(),

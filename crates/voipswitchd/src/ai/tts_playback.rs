@@ -49,11 +49,13 @@ impl TtsPlayback {
         if !pcm16_le.len().is_multiple_of(2) {
             bail!("PCM16LE payload must contain complete samples");
         }
-        let samples_per_packet = 160;
+        // Gateway output is fixed PCM16LE/16 kHz.  RTP G.711 is 8 kHz, so select every second
+        // sample before packetizing; 320 input samples become one 20 ms / 160 byte packet.
+        let input_samples_per_packet = 320;
         let mut frames = Vec::new();
-        for chunk in pcm16_le.chunks(samples_per_packet * 2) {
+        for chunk in pcm16_le.chunks(input_samples_per_packet * 2) {
             let payload = chunk
-                .chunks_exact(2)
+                .chunks_exact(4)
                 .map(|bytes| {
                     let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
                     match codec {
@@ -67,7 +69,7 @@ impl TtsPlayback {
                 timestamp: self.timestamp,
                 payload,
             });
-            self.timestamp = self.timestamp.wrapping_add(samples_per_packet as u32);
+            self.timestamp = self.timestamp.wrapping_add(160);
         }
         Ok(frames)
     }
@@ -115,12 +117,14 @@ mod tests {
         let frames = playback
             .packetize(&vec![0; 320 * 2], PlaybackCodec::Pcma)
             .unwrap();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload.len(), 160);
-        assert_eq!(frames[1].timestamp, 160);
         playback.interrupt(2).unwrap();
         assert_eq!(
-            playback.packetize(&[0, 0], PlaybackCodec::Pcmu).unwrap()[0].generation,
+            playback
+                .packetize(&[0, 0, 0, 0], PlaybackCodec::Pcmu)
+                .unwrap()[0]
+                .generation,
             2
         );
     }

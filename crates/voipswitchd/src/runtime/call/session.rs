@@ -33,6 +33,8 @@ pub(crate) enum ControlMessage {
     PeerDigitEvent(DigitEvent),
     DtmfInfoSendResult(DtmfInfoSendResult),
     AttemptRegistrationResult(AttemptRegistrationResult),
+    AiActionRequested(ai_protocol::control::ActionRequested),
+    AiGatewayUnavailable,
     PrepareCoordinatorHandoff {
         token: CoordinatorHandoffToken,
         reply: oneshot::Sender<Result<CoordinatorHandoffPackage, String>>,
