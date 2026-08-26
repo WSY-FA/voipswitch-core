@@ -8,9 +8,12 @@ use ai_protocol::id::{ConnectorInstanceId, MessageId};
 use ai_protocol::media::{MediaFrame, read_media_frame, write_media_frame};
 use ai_protocol::time::unix_timestamp_ms;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -58,6 +61,7 @@ pub(crate) struct AiConnector {
     profile_catalog: watch::Receiver<Option<ProfileCatalogSnapshot>>,
     sequence: Arc<AtomicU64>,
     metrics: Arc<ConnectorMetrics>,
+    tts_waiters: Arc<Mutex<BTreeMap<String, Sender<ai_protocol::control::TtsSynthesized>>>>,
 }
 
 impl AiConnector {
@@ -71,6 +75,7 @@ impl AiConnector {
         let (profile_catalog_tx, profile_catalog) = watch::channel(None);
         let sequence = Arc::new(AtomicU64::new(1));
         let metrics = Arc::new(ConnectorMetrics::default());
+        let tts_waiters = Arc::new(Mutex::new(BTreeMap::new()));
 
         tokio::spawn(run_control_connection(
             config.control_socket,
@@ -81,6 +86,7 @@ impl AiConnector {
             sequence.clone(),
             metrics.clone(),
             profile_catalog_tx,
+            tts_waiters.clone(),
         ));
         tokio::spawn(run_media_connection(
             config.media_socket,
@@ -98,6 +104,7 @@ impl AiConnector {
             profile_catalog,
             sequence,
             metrics,
+            tts_waiters,
         })
     }
 
@@ -186,6 +193,44 @@ impl AiConnector {
         self.try_send(ControlMessage::StartConversation(request))
     }
 
+    pub(crate) fn synthesize_tts(
+        &self,
+        profile_id: ai_protocol::id::ProfileId,
+        text: String,
+    ) -> Result<ai_protocol::control::TtsSynthesized> {
+        let request_id = format!("core-tts-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
+        info!(request_id = %request_id, "queueing TTS synthesis request");
+        let (tx, rx): (Sender<_>, Receiver<_>) = std::sync::mpsc::channel();
+        self.tts_waiters
+            .lock()
+            .expect("TTS waiters lock poisoned")
+            .insert(request_id.clone(), tx);
+        if let Err(error) = self.try_send(ControlMessage::SynthesizeTts(
+            ai_protocol::control::SynthesizeTts {
+                request_id: request_id.clone(),
+                profile_id,
+                text,
+                voice: String::new(),
+            },
+        )) {
+            self.tts_waiters
+                .lock()
+                .expect("TTS waiters lock poisoned")
+                .remove(&request_id);
+            return Err(error);
+        }
+        match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.tts_waiters
+                    .lock()
+                    .expect("TTS waiters lock poisoned")
+                    .remove(&request_id);
+                bail!("TTS synthesis timed out: {error}")
+            }
+        }
+    }
+
     pub(crate) fn try_send_action_result(
         &self,
         result: ai_protocol::control::ActionResult,
@@ -242,6 +287,7 @@ async fn run_control_connection(
     sequence: Arc<AtomicU64>,
     metrics: Arc<ConnectorMetrics>,
     profile_catalog_tx: watch::Sender<Option<ProfileCatalogSnapshot>>,
+    tts_waiters: Arc<Mutex<BTreeMap<String, Sender<ai_protocol::control::TtsSynthesized>>>>,
 ) {
     let mut delay = RECONNECT_MIN_DELAY;
     loop {
@@ -256,6 +302,9 @@ async fn run_control_connection(
                     tokio::select! {
                         outbound_message = outbound.recv() => {
                             let Some(outbound_message) = outbound_message else { return; };
+                            if matches!(outbound_message.message, ControlMessage::SynthesizeTts(_)) {
+                                info!("sending TTS synthesis request to gateway");
+                            }
                             if let Err(error) = write_json_frame(&mut writer, &outbound_message).await {
                                 warn!(error = %error, "AI control write failed; durable outbox will retry");
                                 break;
@@ -284,6 +333,11 @@ async fn run_control_connection(
                                             profiles = snapshot.profiles.len(),
                                             "AI profile catalog updated"
                                         );
+                                    }
+                                    if let ControlMessage::TtsSynthesized(response) = &envelope.message {
+                                        if let Some(waiter) = tts_waiters.lock().expect("TTS waiters lock poisoned").remove(&response.request_id) {
+                                            let _ = waiter.send(response.clone());
+                                        }
                                     }
                                     let _ = events.send(envelope);
                                 }

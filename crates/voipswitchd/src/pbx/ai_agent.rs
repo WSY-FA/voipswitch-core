@@ -8,6 +8,8 @@ pub(crate) mod model {
         pub name: String,
         pub service_number: String,
         pub profile_id: String,
+        pub welcome_text: Option<String>,
+        pub welcome_audio: Option<Vec<u8>>,
         pub enabled: bool,
         pub revision: u64,
         pub fallback_target: Option<String>,
@@ -83,6 +85,7 @@ pub(crate) mod config {
     };
     use crate::pbx::vc_config::{VcConfigTableHandler, VcConfigTableRegistry};
     use anyhow::{Context, Result, anyhow, ensure};
+    use base64::Engine;
     use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement, TransactionTrait};
     use serde_json::{Map, Value, json};
     use std::collections::BTreeMap;
@@ -105,7 +108,7 @@ pub(crate) mod config {
         let rows = conn
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT id,agent_id,name,service_number,profile_id,enabled,revision,fallback_target
+                "SELECT id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,enabled,revision,fallback_target
                  FROM ai_agent WHERE domain_id=? ORDER BY service_number,id",
                 vec![domain_id.as_str().into()],
             ))
@@ -119,6 +122,8 @@ pub(crate) mod config {
                     name: row.try_get("", "name")?,
                     service_number: row.try_get("", "service_number")?,
                     profile_id: row.try_get("", "profile_id")?,
+                    welcome_text: row.try_get("", "welcome_text")?,
+                    welcome_audio: row.try_get("", "welcome_audio")?,
                     enabled: row.try_get::<i64>("", "enabled")? != 0,
                     revision: u64::try_from(row.try_get::<i64>("", "revision")?)
                         .context("AI Agent revision is negative")?,
@@ -156,6 +161,8 @@ pub(crate) mod config {
                             "name",
                             "service_number",
                             "profile_id",
+                            "welcome_text",
+                            "welcome_audio",
                             "enabled",
                             "revision",
                             "fallback_target",
@@ -173,7 +180,8 @@ pub(crate) mod config {
                         !set.contains_key("id"),
                         "id is server-assigned for ai_agent insert"
                     );
-                    let agent = agent_from_set(&set, None)?;
+                    let mut agent = agent_from_set(&set, None)?;
+                    prepare_welcome(state, &mut agent)?;
                     validate_agent(state, &domain_id, &agent)?;
                     let id = with_seaorm_backend(state, |backend| {
                         backend.block_on(insert_agent(backend, &domain_id, &agent))
@@ -187,7 +195,13 @@ pub(crate) mod config {
                         .into_iter()
                         .find(|row| row.id == id)
                         .ok_or_else(|| anyhow!("RESOURCE_NOT_FOUND: ai_agent id {id}"))?;
-                    let agent = agent_from_set(&decoded_set(command)?, Some(existing))?;
+                    let set = decoded_set(command)?;
+                    let previous_profile = existing.profile_id.clone();
+                    let mut agent = agent_from_set(&set, Some(existing))?;
+                    if agent.profile_id != previous_profile {
+                        agent.welcome_audio = None;
+                    }
+                    prepare_welcome(state, &mut agent)?;
                     validate_agent(state, &domain_id, &agent)?;
                     with_seaorm_backend(state, |backend| {
                         backend.block_on(update_agent(backend, &domain_id, &agent))
@@ -239,6 +253,47 @@ pub(crate) mod config {
             "profile_id",
         )?;
         ai_protocol::id::ProfileId::new(profile_id.clone())?;
+        let welcome_text = set
+            .get("welcome_text")
+            .cloned()
+            .or_else(|| existing.as_ref().and_then(|item| item.welcome_text.clone()))
+            .filter(|value| !value.trim().is_empty());
+        let welcome_audio = set
+            .get("welcome_audio_base64")
+            .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
+            .transpose()
+            .map_err(|error| anyhow!("welcome_audio_base64 is invalid: {error}"))?
+            .filter(|bytes| !bytes.is_empty())
+            .or_else(|| {
+                if set.contains_key("welcome_audio_base64") {
+                    None
+                } else {
+                    existing
+                        .as_ref()
+                        .and_then(|item| item.welcome_audio.clone())
+                }
+            });
+        // A generated WAV is kept alongside its source text as a cache. Explicit edits clear
+        // the opposite input; an update with neither field preserves the existing cache.
+        let welcome_text =
+            if set.contains_key("welcome_audio_base64") && !set.contains_key("welcome_text") {
+                None
+            } else {
+                welcome_text
+            };
+        let welcome_audio =
+            if set.contains_key("welcome_text") && !set.contains_key("welcome_audio_base64") {
+                None
+            } else {
+                welcome_audio
+            };
+        if let Some(bytes) = &welcome_audio {
+            ensure!(bytes.len() <= 768 * 1024, "welcome audio is too large");
+            ensure!(
+                bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+                "welcome audio must be a RIFF/WAVE file"
+            );
+        }
         let enabled = set
             .get("enabled")
             .map(|value| parse_bool(value))
@@ -260,6 +315,8 @@ pub(crate) mod config {
             name,
             service_number,
             profile_id,
+            welcome_text,
+            welcome_audio,
             enabled,
             revision: existing.as_ref().map(|item| item.revision).unwrap_or(1),
             fallback_target,
@@ -336,6 +393,56 @@ pub(crate) mod config {
         Ok(())
     }
 
+    fn prepare_welcome(state: &AppState, agent: &mut AiAgentConfig) -> Result<()> {
+        let Some(text) = agent.welcome_text.clone() else {
+            return Ok(());
+        };
+        if agent.welcome_audio.is_some() {
+            return Ok(());
+        }
+        let jobs = state
+            .ai_jobs()
+            .ok_or_else(|| anyhow!("AI gateway is unavailable"))?;
+        let profile_id = ai_protocol::id::ProfileId::new(agent.profile_id.clone())?;
+        let synthesized = tokio::task::block_in_place(|| jobs.synthesize_tts(profile_id, text))?;
+        ensure!(
+            synthesized.success,
+            synthesized
+                .error
+                .unwrap_or_else(|| "TTS synthesis failed".to_string())
+        );
+        ensure!(
+            !synthesized.pcm16_le.is_empty() && synthesized.pcm16_le.len().is_multiple_of(2),
+            "TTS returned empty audio"
+        );
+        let sample_rate = synthesized.sample_rate;
+        ensure!(
+            (8_000..=48_000).contains(&sample_rate),
+            "TTS returned unsupported sample rate"
+        );
+        agent.welcome_audio = Some(pcm_wav(&synthesized.pcm16_le, sample_rate));
+        Ok(())
+    }
+
+    fn pcm_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+        let data_len = pcm.len() as u32;
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(pcm);
+        wav
+    }
+
     fn project(domain_id: &DomainId, agent: &AiAgentConfig, keys: &[String]) -> Value {
         let mut object = Map::new();
         for key in keys {
@@ -346,6 +453,13 @@ pub(crate) mod config {
                 "name" => json!(agent.name),
                 "service_number" => json!(agent.service_number),
                 "profile_id" => json!(agent.profile_id),
+                "welcome_text" => json!(agent.welcome_text),
+                "welcome_audio" => json!(
+                    agent
+                        .welcome_audio
+                        .as_ref()
+                        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                ),
                 "enabled" => json!(agent.enabled),
                 "revision" => json!(agent.revision),
                 "fallback_target" => json!(agent.fallback_target),
@@ -389,12 +503,12 @@ pub(crate) mod config {
         let now = i64::try_from(unix_timestamp_ms()).context("timestamp overflow")?;
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO ai_agent (domain_id,id,agent_id,name,service_number,profile_id,enabled,revision,fallback_target,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,1,?,?,?)",
+            "INSERT INTO ai_agent (domain_id,id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,enabled,revision,fallback_target,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?)",
             vec![
                 domain_id.as_str().into(), i64::try_from(id)?.into(), agent.agent_id.clone().into(),
                 agent.name.clone().into(), agent.service_number.clone().into(), agent.profile_id.clone().into(),
-                agent.enabled.into(), agent.fallback_target.clone().into(), now.into(), now.into(),
+                agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(), now.into(), now.into(),
             ],
         )).await?;
         crate::pbx::domain::config::bump_domain_config_version(&txn).await?;
@@ -411,11 +525,11 @@ pub(crate) mod config {
         let txn = conn.begin().await?;
         let result = txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE ai_agent SET agent_id=?,name=?,service_number=?,profile_id=?,enabled=?,revision=revision+1,fallback_target=?,updated_at=?
+            "UPDATE ai_agent SET agent_id=?,name=?,service_number=?,profile_id=?,welcome_text=?,welcome_audio=?,enabled=?,revision=revision+1,fallback_target=?,updated_at=?
              WHERE domain_id=? AND id=?",
             vec![
                 agent.agent_id.clone().into(), agent.name.clone().into(), agent.service_number.clone().into(),
-                agent.profile_id.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(),
+                agent.profile_id.clone().into(), agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(),
                 i64::try_from(unix_timestamp_ms())?.into(), domain_id.as_str().into(), i64::try_from(agent.id)?.into(),
             ],
         )).await?;

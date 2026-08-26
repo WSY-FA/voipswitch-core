@@ -218,6 +218,8 @@ async fn create_ai_agent_tables(conn: &DatabaseConnection) -> Result<()> {
             name TEXT NOT NULL,
             service_number TEXT NOT NULL,
             profile_id TEXT NOT NULL,
+            welcome_text TEXT,
+            welcome_audio BLOB,
             enabled INTEGER NOT NULL DEFAULT 1,
             revision INTEGER NOT NULL DEFAULT 1,
             fallback_target TEXT,
@@ -235,6 +237,20 @@ async fn create_ai_agent_tables(conn: &DatabaseConnection) -> Result<()> {
             .to_string(),
     ))
     .await?;
+    if !has_sqlite_column(conn, "ai_agent", "welcome_text").await? {
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE ai_agent ADD COLUMN welcome_text TEXT".to_string(),
+        ))
+        .await?;
+    }
+    if !has_sqlite_column(conn, "ai_agent", "welcome_audio").await? {
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE ai_agent ADD COLUMN welcome_audio BLOB".to_string(),
+        ))
+        .await?;
+    }
     Ok(())
 }
 

@@ -12,6 +12,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 aya = "0.13"
 argon2 = "0.5"
 chrono = "0.4"

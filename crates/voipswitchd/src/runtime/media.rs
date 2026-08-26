@@ -360,6 +360,7 @@ pub struct MediaBridgeHandle {
     callee_remote_rtp: Arc<RwLock<Option<SocketAddr>>>,
     callee_remote_rtcp: Arc<RwLock<Option<SocketAddr>>>,
     caller_advertise_ip: IpAddr,
+    counters: Arc<RelayCounters>,
     recording_tap: Arc<StdRwLock<Option<RecordingTapSender>>>,
     ai_tap: Arc<StdRwLock<Option<AiMediaTapSender>>>,
     recording: Arc<Mutex<Option<RecordingSession>>>,
@@ -583,6 +584,7 @@ impl MediaBridge {
             callee_remote_rtp: self.callee_remote_rtp.clone(),
             callee_remote_rtcp: self.callee_remote_rtcp.clone(),
             caller_advertise_ip: self.caller_advertise_ip,
+            counters: self.counters.clone(),
             recording_tap: self.recording_tap.clone(),
             ai_tap: self.ai_tap.clone(),
             recording: self.recording.clone(),
@@ -733,10 +735,17 @@ impl MediaBridgeHandle {
         packet.extend_from_slice(&timestamp.to_be_bytes());
         packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(payload);
-        self.caller_rtp
+        let sent = self
+            .caller_rtp
             .send_to(&packet, remote)
             .await
-            .context("send TTS RTP packet")
+            .context("send TTS RTP packet")?;
+        count_packet(
+            &self.counters,
+            RelayDirection::CalleeToCallerRtp,
+            sent as u64,
+        );
+        Ok(sent)
     }
 
     pub(crate) fn bind_dtmf_sessions(&self, bindings: DtmfSessionBindings) {
@@ -1589,6 +1598,16 @@ fn spawn_relay(spec: RelayTaskSpec, mut stop_rx: watch::Receiver<bool>) -> JoinH
                     }
                     let remote = *spec.target.read().await;
                     let Some(remote) = remote else {
+                        if spec.ai_tap.is_some()
+                            && matches!(
+                                spec.direction,
+                                RelayDirection::CallerToCalleeRtp
+                                    | RelayDirection::CalleeToCallerRtp
+                            )
+                            && valid_media_packet(spec.direction, &packet[..size])
+                        {
+                            count_packet(&spec.counters, spec.direction, size as u64);
+                        }
                         continue;
                     };
                     if let Some((tap, side)) = &spec.recording

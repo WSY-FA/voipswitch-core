@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -110,18 +110,64 @@ impl AiJobService {
         self.connector.executable_voice_agent_profile(profile_id)
     }
 
+    pub(crate) fn synthesize_tts(
+        &self,
+        profile_id: ai_protocol::id::ProfileId,
+        text: String,
+    ) -> Result<ai_protocol::control::TtsSynthesized> {
+        self.connector.synthesize_tts(profile_id, text)
+    }
+
     pub(crate) fn try_start_voice_agent(
         &self,
         request: StartConversation,
         media: MediaBridgeHandle,
         tap: AiMediaTapSpec,
-    ) -> Result<()> {
+    ) -> Result<AiMediaTapSender> {
         anyhow::ensure!(
             request.conversation == tap.job,
             "voice-agent tap identity mismatch"
         );
-        self.connector.try_start_conversation(request)?;
-        media.enable_ai_tap(AiMediaTapSender::new(self.connector.clone(), tap))
+        self.connector.try_start_conversation(request.clone())?;
+        self.spawn_voice_start_watchdog(request);
+        let sender = AiMediaTapSender::new(self.connector.clone(), tap);
+        media.enable_ai_tap(sender.clone())?;
+        Ok(sender)
+    }
+
+    fn spawn_voice_start_watchdog(&self, request: StartConversation) {
+        let connector = self.connector.clone();
+        tokio::spawn(async move {
+            let mut events = connector.subscribe();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        conversation_id = %request.conversation.conversation_id,
+                        "AI voice-agent start was not acknowledged before timeout"
+                    );
+                    return;
+                }
+                tokio::select! {
+                    event = events.recv() => match event {
+                        Ok(envelope) => {
+                            if let ControlMessage::ConversationReady(ready) = envelope.message
+                                && ready.conversation == request.conversation
+                            {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if connector.is_control_connected() {
+                            let _ = connector.try_start_conversation(request.clone());
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub(crate) fn subscribe_media(&self) -> tokio::sync::broadcast::Receiver<MediaFrame> {

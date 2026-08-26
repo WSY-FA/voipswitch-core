@@ -37,6 +37,7 @@ pub(crate) use crate::runtime::call::actor::{CalleeSessionActor, SessionActor};
 use crate::runtime::call::actor::{CoordinatorRuntimeState, InitialCallAction, PendingAnswer};
 use crate::runtime::media::{DtmfSessionBindings, MediaPlaneManager};
 use crate::runtime::recording::RecordingSpec;
+use ai_protocol::control::WelcomePrompt;
 use ai_protocol::control::{
     AiProfileSnapshot, AudioCodec, JobRef, MediaDirection, Participant, StartConversation,
     StreamBinding, SubmitPostCallJob,
@@ -415,11 +416,12 @@ impl SessionActor {
         if let OutboundTarget::AiAgent { agent_id } = &first_candidate.outbound_target
             && let Some(ai_jobs) = state.ai_jobs()
         {
-            let profile_id = domain
+            let agent_config = domain
                 .ai_agents
                 .iter()
                 .find(|agent| agent.agent_id == *agent_id)
-                .map(|agent| agent.profile_id.clone());
+                .cloned();
+            let profile_id = agent_config.as_ref().map(|agent| agent.profile_id.clone());
             if let Some(profile_id) = profile_id
                 && let Some(profile) = ai_jobs.executable_voice_agent_profile(&profile_id)
             {
@@ -445,8 +447,17 @@ impl SessionActor {
                         sample_rate: 8_000,
                         channels: 1,
                     },
+                    welcome: agent_config
+                        .as_ref()
+                        .and_then(|agent| agent.welcome_audio.clone().map(WelcomePrompt::PcmWav)),
                 };
                 let conversation = request.conversation.clone();
+                // Subscribe before starting the conversation.  The Gateway may emit a
+                // welcome prompt as soon as the first captured media frame arrives;
+                // creating these receivers first prevents that short prompt from being
+                // lost during call setup.
+                let ai_media = ai_jobs.subscribe_media();
+                let ai_controls = ai_jobs.subscribe_control();
                 let tap = AiMediaTapSpec {
                     job: conversation.clone(),
                     caller: AiTapStreamSpec {
@@ -467,41 +478,44 @@ impl SessionActor {
                         sample_rate: 8_000,
                         channels: 1,
                     },
+                    caller_input_enabled: request.welcome.is_none(),
                 };
-                if let Err(error) =
-                    ai_jobs.try_start_voice_agent(request, media_handle.clone(), tap)
-                {
-                    warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
-                } else {
-                    record_ai_agent_trace(
-                        &state,
-                        &call_id,
-                        &event.domain_id,
-                        &event.adapter_call_leg_id,
-                        &caller_session_id,
-                        "conversation_started",
-                        conversation.generation,
-                        json!({
-                            "agent_id": agent_id,
-                            "agent_revision": domain.ai_agents.iter().find(|agent| agent.agent_id == *agent_id).map(|agent| agent.revision),
-                            "round": 0,
-                        }),
-                    );
-                    spawn_ai_agent_playback(
-                        ai_jobs.subscribe_media(),
-                        ai_jobs.subscribe_control(),
-                        media_handle.clone(),
-                        conversation,
-                        call_id.clone(),
-                        state.clone(),
-                        domain
-                            .ai_agents
-                            .iter()
-                            .find(|agent| agent.agent_id == *agent_id)
-                            .map(|agent| agent.revision),
-                        event.adapter_call_leg_id.clone(),
-                        caller_session_id.clone(),
-                    );
+                match ai_jobs.try_start_voice_agent(request, media_handle.clone(), tap) {
+                    Ok(tap_sender) => {
+                        record_ai_agent_trace(
+                            &state,
+                            &call_id,
+                            &event.domain_id,
+                            &event.adapter_call_leg_id,
+                            &caller_session_id,
+                            "conversation_started",
+                            conversation.generation,
+                            json!({
+                                "agent_id": agent_id,
+                                "agent_revision": domain.ai_agents.iter().find(|agent| agent.agent_id == *agent_id).map(|agent| agent.revision),
+                                "round": 0,
+                            }),
+                        );
+                        spawn_ai_agent_playback(
+                            ai_media,
+                            ai_controls,
+                            media_handle.clone(),
+                            conversation,
+                            call_id.clone(),
+                            state.clone(),
+                            domain
+                                .ai_agents
+                                .iter()
+                                .find(|agent| agent.agent_id == *agent_id)
+                                .map(|agent| agent.revision),
+                            event.adapter_call_leg_id.clone(),
+                            caller_session_id.clone(),
+                            tap_sender,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(call_id = %call_id, error = %error, "AI Agent conversation start deferred");
+                    }
                 }
             }
         }
@@ -1400,6 +1414,7 @@ fn build_ai_submission(
             sample_rate: 8_000,
             channels: 1,
         },
+        caller_input_enabled: true,
     };
     Ok((request, tap))
 }
@@ -1415,6 +1430,7 @@ fn spawn_ai_agent_playback(
     agent_revision: Option<u64>,
     adapter_call_leg_id: String,
     session_id: String,
+    tap_sender: crate::ai::AiMediaTapSender,
 ) {
     tokio::spawn(async move {
         let mut playback = match TtsPlayback::new(conversation.generation) {
@@ -1427,6 +1443,9 @@ fn spawn_ai_agent_playback(
         let mut playback_generation = conversation.generation;
         let mut traced_tts_generation = None;
         let mut rtp_sequence = 1_u16;
+        // Keep RTP pacing on an absolute clock. Sleeping a fixed 20ms after each
+        // send adds every IPC/UDP scheduling delay to the audio duration.
+        let mut next_rtp_at: Option<tokio::time::Instant> = None;
         let ssrc = call_id.bytes().fold(0x4150_4258_u32, |value, byte| {
             value.rotate_left(5) ^ u32::from(byte)
         });
@@ -1456,6 +1475,7 @@ fn spawn_ai_agent_playback(
                                         playback_generation = tts_state.generation;
                                     }
                                 } else if tts_state.state == ai_protocol::control::TtsState::Stopped {
+                                    tap_sender.set_caller_input_enabled(true);
                                     record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_stopped", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
                                 }
                             }
@@ -1501,6 +1521,12 @@ fn spawn_ai_agent_playback(
                     continue;
                 }
             };
+            // Each TTS generation starts a fresh playout clock. TTS is produced
+            // after ASR/LLM latency, so a clock created at call setup would be
+            // far behind and cause a burst of catch-up packets.
+            if traced_tts_generation != Some(frame.metadata.generation) {
+                next_rtp_at = Some(tokio::time::Instant::now());
+            }
             if traced_tts_generation != Some(frame.metadata.generation) {
                 record_ai_agent_trace(
                     &state,
@@ -1518,6 +1544,8 @@ fn spawn_ai_agent_playback(
                 if media.is_stopped() || packet.generation != playback_generation {
                     break;
                 }
+                let target = next_rtp_at.expect("TTS playout clock initialized");
+                tokio::time::sleep_until(target).await;
                 if let Err(error) = media
                     .send_tts_rtp(&packet.payload, 8, packet.timestamp, rtp_sequence, ssrc)
                     .await
@@ -1526,8 +1554,9 @@ fn spawn_ai_agent_playback(
                     return;
                 }
                 rtp_sequence = rtp_sequence.wrapping_add(1);
+                next_rtp_at = Some(target + Duration::from_millis(20));
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    _ = tokio::time::sleep_until(next_rtp_at.expect("TTS playout clock initialized")) => {}
                     result = controls.recv() => match result {
                         Ok(envelope) => {
                             if let ai_protocol::control::ControlMessage::TtsStateChanged(tts_state) = envelope.message
@@ -1544,6 +1573,7 @@ fn spawn_ai_agent_playback(
                                         playback_generation = tts_state.generation;
                                     }
                                 } else if tts_state.state == ai_protocol::control::TtsState::Stopped {
+                                    tap_sender.set_caller_input_enabled(true);
                                     record_ai_agent_trace(&state, &call_id, conversation.tenant_id.as_str(), &adapter_call_leg_id, &session_id, "tts_stopped", tts_state.generation, json!({"agent_revision": agent_revision, "round": tts_state.generation}));
                                 }
                                 break;

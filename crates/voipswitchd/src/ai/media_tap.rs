@@ -4,7 +4,7 @@ use ai_protocol::id::{ParticipantId, StreamId};
 use ai_protocol::media::{MediaFrame, MediaFrameMetadata};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AiTapSide {
@@ -27,6 +27,7 @@ pub(crate) struct AiMediaTapSpec {
     pub(crate) job: JobRef,
     pub(crate) caller: AiTapStreamSpec,
     pub(crate) callee: AiTapStreamSpec,
+    pub(crate) caller_input_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +56,7 @@ struct AiMediaTapInner {
     packets_tapped: AtomicU64,
     packets_dropped: AtomicU64,
     packets_ignored: AtomicU64,
+    caller_input_enabled: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -79,11 +81,18 @@ impl AiMediaTapSender {
                 packets_tapped: AtomicU64::new(0),
                 packets_dropped: AtomicU64::new(0),
                 packets_ignored: AtomicU64::new(0),
+                caller_input_enabled: AtomicBool::new(spec.caller_input_enabled),
             }),
         }
     }
 
     pub(crate) fn tap(&self, side: AiTapSide, packet: &[u8]) {
+        if matches!(side, AiTapSide::Caller)
+            && !self.inner.caller_input_enabled.load(Ordering::Acquire)
+        {
+            self.inner.packets_ignored.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let stream = match side {
             AiTapSide::Caller => &self.inner.caller,
             AiTapSide::Callee => &self.inner.callee,
@@ -127,6 +136,12 @@ impl AiMediaTapSender {
         } else {
             self.inner.packets_dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn set_caller_input_enabled(&self, enabled: bool) {
+        self.inner
+            .caller_input_enabled
+            .store(enabled, Ordering::Release);
     }
 
     pub(crate) fn finish(&self) -> AiCaptureFinalized {
