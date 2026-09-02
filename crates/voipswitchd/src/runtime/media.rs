@@ -748,6 +748,14 @@ impl MediaBridgeHandle {
         Ok(sent)
     }
 
+    pub(crate) fn set_ai_caller_input_enabled(&self, enabled: bool) {
+        if let Ok(tap) = self.ai_tap.read()
+            && let Some(tap) = tap.as_ref()
+        {
+            tap.set_caller_input_enabled(enabled);
+        }
+    }
+
     pub(crate) fn bind_dtmf_sessions(&self, bindings: DtmfSessionBindings) {
         self.dtmf_dispatch.send_replace(Some(DtmfDispatchBindings {
             domain_id: DomainId::from(bindings.domain_id),

@@ -6,7 +6,8 @@ use super::{
 use crate::data_store::{AiCallResultRecord, ConfigBackend};
 use crate::runtime::media::MediaBridgeHandle;
 use ai_protocol::control::{
-    ActionResult, ControlMessage, JobResultRequest, JobState, StartConversation, SubmitPostCallJob,
+    ActionResult, ControlMessage, JobRef, JobResultRequest, JobState, StartConversation,
+    StopConversation, SubmitPostCallJob,
 };
 use ai_protocol::media::MediaFrame;
 use anyhow::{Context, Result};
@@ -48,6 +49,18 @@ pub(crate) struct AiJobService {
 }
 
 impl AiJobService {
+    pub(crate) fn try_stop_voice_conversation(
+        &self,
+        conversation: JobRef,
+        reason: String,
+    ) -> Result<()> {
+        self.connector
+            .try_send(ControlMessage::StopConversation(StopConversation {
+                conversation,
+                reason,
+            }))
+    }
+
     pub(crate) fn spawn(backend: Arc<dyn ConfigBackend>, connector: AiConnector) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let voice_coordinators = Arc::new(Mutex::new(BTreeMap::new()));

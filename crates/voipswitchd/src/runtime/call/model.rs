@@ -22,6 +22,7 @@ pub(crate) struct CallRuntime {
     pub(crate) caller_number: String,
     pub(crate) callee_number: String,
     pub(crate) callee_target: String,
+    pub(crate) ai_agent_call: bool,
     pub(crate) ai_agent_revision: Option<u64>,
     pub(crate) ai_fallback_target: Option<String>,
     pub(crate) inbound_route_id: Option<String>,
@@ -136,6 +137,7 @@ impl CallRuntime {
             caller_number,
             callee_number,
             callee_target: candidate.outbound_target.stable_ref(),
+            ai_agent_call: matches!(&candidate.outbound_target, OutboundTarget::AiAgent { .. }),
             ai_agent_revision: candidate.ai_agent_revision,
             ai_fallback_target: candidate.ai_fallback_target.clone(),
             outbound_trunk_ref: candidate.outbound_trunk_ref.clone(),
@@ -345,6 +347,35 @@ impl CallRuntime {
             .select_winner(&self.current_attempt_id, answered_at_ms)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn mark_transfer_answered(
+        &mut self,
+        answered_at_ms: u64,
+        media_generation: u64,
+    ) -> Result<(), String> {
+        self.update_current_attempt(CalleeAttemptState::Answered, None)?;
+        self.select_current_attempt(answered_at_ms)?;
+        self.aggregate.release_all_bridges(answered_at_ms);
+        self.caller.state = LegState::Bridged;
+        self.aggregate
+            .update_leg_state(&self.caller.id, LegState::Bridged)
+            .map_err(|error| error.to_string())?;
+        self.aggregate
+            .update_leg_state(&self.current_callee_session_id, LegState::Bridged)
+            .map_err(|error| error.to_string())?;
+        let bridge_id = BridgeId::from(format!("bridge-{}", self.current_attempt_id));
+        self.aggregate
+            .add_bridge(
+                bridge_id.clone(),
+                self.caller.id.clone(),
+                self.current_callee_session_id.clone(),
+                media_generation,
+                answered_at_ms,
+            )
+            .map_err(|error| error.to_string())?;
+        self.current_bridge_id = Some(bridge_id);
+        Ok(())
     }
 }
 

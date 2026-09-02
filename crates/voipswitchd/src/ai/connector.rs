@@ -334,10 +334,10 @@ async fn run_control_connection(
                                             "AI profile catalog updated"
                                         );
                                     }
-                                    if let ControlMessage::TtsSynthesized(response) = &envelope.message {
-                                        if let Some(waiter) = tts_waiters.lock().expect("TTS waiters lock poisoned").remove(&response.request_id) {
-                                            let _ = waiter.send(response.clone());
-                                        }
+                                    if let ControlMessage::TtsSynthesized(response) = &envelope.message
+                                        && let Some(waiter) = tts_waiters.lock().expect("TTS waiters lock poisoned").remove(&response.request_id)
+                                    {
+                                        let _ = waiter.send(response.clone());
                                     }
                                     let _ = events.send(envelope);
                                 }

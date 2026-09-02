@@ -1,8 +1,9 @@
 use crate::app::AppState;
 use crate::config_service::{
-    CALL_TRACE_ENABLED_KEY, CDR_SPOOL_REJECT_MB_KEY, CDR_SPOOL_RESUME_MB_KEY,
-    CDR_SPOOL_WARNING_MB_KEY, LOG_LEVEL_KEY, RECORDING_DIR_KEY, RECORDING_MAX_SIZE_GB_KEY,
-    RECORDING_RETENTION_DAYS_KEY, RuntimeConfig, SIP_PORT_KEY, is_log_level,
+    AI_WELCOME_AUDIO_DIR_KEY, CALL_TRACE_ENABLED_KEY, CDR_SPOOL_REJECT_MB_KEY,
+    CDR_SPOOL_RESUME_MB_KEY, CDR_SPOOL_WARNING_MB_KEY, LOG_LEVEL_KEY, RECORDING_DIR_KEY,
+    RECORDING_MAX_SIZE_GB_KEY, RECORDING_RETENTION_DAYS_KEY, RuntimeConfig, SIP_PORT_KEY,
+    is_log_level,
 };
 use crate::pbx::command_helpers::{
     decoded_set, selected_keys, split_conditions, with_seaorm_backend,
@@ -27,6 +28,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     SIP_PORT_KEY,
     LOG_LEVEL_KEY,
     RECORDING_DIR_KEY,
+    AI_WELCOME_AUDIO_DIR_KEY,
     RECORDING_RETENTION_DAYS_KEY,
     RECORDING_MAX_SIZE_GB_KEY,
     CDR_SPOOL_WARNING_MB_KEY,
@@ -267,22 +269,21 @@ fn normalize_setting(key: &str, value: &str) -> Result<NormalizedSetting> {
             );
             Ok(NormalizedSetting::String(level))
         }
-        RECORDING_DIR_KEY => {
+        RECORDING_DIR_KEY | AI_WELCOME_AUDIO_DIR_KEY => {
             let path = value.trim();
             if path.is_empty() {
                 return Ok(NormalizedSetting::String(String::new()));
             }
             ensure!(
                 Path::new(path).is_absolute(),
-                "{RECORDING_DIR_KEY} must be an absolute path"
+                "{key} must be an absolute path"
             );
-            std::fs::create_dir_all(path)
-                .map_err(|err| anyhow!("cannot create {RECORDING_DIR_KEY}: {err}"))?;
-            let metadata = std::fs::metadata(path)
-                .map_err(|err| anyhow!("cannot inspect {RECORDING_DIR_KEY}: {err}"))?;
+            std::fs::create_dir_all(path).map_err(|err| anyhow!("cannot create {key}: {err}"))?;
+            let metadata =
+                std::fs::metadata(path).map_err(|err| anyhow!("cannot inspect {key}: {err}"))?;
             ensure!(
                 metadata.is_dir() && !metadata.permissions().readonly(),
-                "{RECORDING_DIR_KEY} must be a writable directory"
+                "{key} must be a writable directory"
             );
             Ok(NormalizedSetting::String(path.to_string()))
         }

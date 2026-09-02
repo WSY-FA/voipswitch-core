@@ -10,6 +10,7 @@ pub(crate) mod model {
         pub profile_id: String,
         pub welcome_text: Option<String>,
         pub welcome_audio: Option<Vec<u8>>,
+        pub welcome_language: String,
         pub enabled: bool,
         pub revision: u64,
         pub fallback_target: Option<String>,
@@ -108,7 +109,7 @@ pub(crate) mod config {
         let rows = conn
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,enabled,revision,fallback_target
+                "SELECT id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,welcome_language,enabled,revision,fallback_target
                  FROM ai_agent WHERE domain_id=? ORDER BY service_number,id",
                 vec![domain_id.as_str().into()],
             ))
@@ -124,6 +125,9 @@ pub(crate) mod config {
                     profile_id: row.try_get("", "profile_id")?,
                     welcome_text: row.try_get("", "welcome_text")?,
                     welcome_audio: row.try_get("", "welcome_audio")?,
+                    welcome_language: row
+                        .try_get::<Option<String>>("", "welcome_language")?
+                        .unwrap_or_else(|| "zh-CN".to_string()),
                     enabled: row.try_get::<i64>("", "enabled")? != 0,
                     revision: u64::try_from(row.try_get::<i64>("", "revision")?)
                         .context("AI Agent revision is negative")?,
@@ -163,6 +167,7 @@ pub(crate) mod config {
                             "profile_id",
                             "welcome_text",
                             "welcome_audio",
+                            "welcome_language",
                             "enabled",
                             "revision",
                             "fallback_target",
@@ -182,6 +187,7 @@ pub(crate) mod config {
                     );
                     let mut agent = agent_from_set(&set, None)?;
                     prepare_welcome(state, &mut agent)?;
+                    persist_welcome_audio(state, &domain_id, &agent)?;
                     validate_agent(state, &domain_id, &agent)?;
                     let id = with_seaorm_backend(state, |backend| {
                         backend.block_on(insert_agent(backend, &domain_id, &agent))
@@ -202,6 +208,7 @@ pub(crate) mod config {
                         agent.welcome_audio = None;
                     }
                     prepare_welcome(state, &mut agent)?;
+                    persist_welcome_audio(state, &domain_id, &agent)?;
                     validate_agent(state, &domain_id, &agent)?;
                     with_seaorm_backend(state, |backend| {
                         backend.block_on(update_agent(backend, &domain_id, &agent))
@@ -253,6 +260,15 @@ pub(crate) mod config {
             "profile_id",
         )?;
         ai_protocol::id::ProfileId::new(profile_id.clone())?;
+        let welcome_language = set
+            .get("welcome_language")
+            .cloned()
+            .or_else(|| existing.as_ref().map(|item| item.welcome_language.clone()))
+            .unwrap_or_else(|| "zh-CN".to_string());
+        ensure!(
+            matches!(welcome_language.as_str(), "zh-CN" | "en-US"),
+            "welcome_language must be zh-CN or en-US"
+        );
         let welcome_text = set
             .get("welcome_text")
             .cloned()
@@ -317,6 +333,7 @@ pub(crate) mod config {
             profile_id,
             welcome_text,
             welcome_audio,
+            welcome_language,
             enabled,
             revision: existing.as_ref().map(|item| item.revision).unwrap_or(1),
             fallback_target,
@@ -424,6 +441,29 @@ pub(crate) mod config {
         Ok(())
     }
 
+    fn persist_welcome_audio(
+        state: &AppState,
+        domain_id: &DomainId,
+        agent: &AiAgentConfig,
+    ) -> Result<()> {
+        let directory = state.config().snapshot().ai_welcome_audio_dir();
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| anyhow!("cannot create AI welcome audio directory: {error}"))?;
+        let path = directory.join(format!(
+            "{}-{}-welcome.wav",
+            domain_id.as_str(),
+            agent.agent_id
+        ));
+        if let Some(bytes) = &agent.welcome_audio {
+            std::fs::write(&path, bytes)
+                .map_err(|error| anyhow!("cannot write AI welcome audio: {error}"))?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|error| anyhow!("cannot remove AI welcome audio: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn pcm_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
         let data_len = pcm.len() as u32;
         let mut wav = Vec::with_capacity(44 + pcm.len());
@@ -454,6 +494,7 @@ pub(crate) mod config {
                 "service_number" => json!(agent.service_number),
                 "profile_id" => json!(agent.profile_id),
                 "welcome_text" => json!(agent.welcome_text),
+                "welcome_language" => json!(agent.welcome_language),
                 "welcome_audio" => json!(
                     agent
                         .welcome_audio
@@ -503,12 +544,12 @@ pub(crate) mod config {
         let now = i64::try_from(unix_timestamp_ms()).context("timestamp overflow")?;
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO ai_agent (domain_id,id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,enabled,revision,fallback_target,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?)",
+            "INSERT INTO ai_agent (domain_id,id,agent_id,name,service_number,profile_id,welcome_text,welcome_audio,welcome_language,enabled,revision,fallback_target,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?, ?,1,?,?,?)",
             vec![
                 domain_id.as_str().into(), i64::try_from(id)?.into(), agent.agent_id.clone().into(),
                 agent.name.clone().into(), agent.service_number.clone().into(), agent.profile_id.clone().into(),
-                agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(), now.into(), now.into(),
+                agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.welcome_language.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(), now.into(), now.into(),
             ],
         )).await?;
         crate::pbx::domain::config::bump_domain_config_version(&txn).await?;
@@ -525,11 +566,11 @@ pub(crate) mod config {
         let txn = conn.begin().await?;
         let result = txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE ai_agent SET agent_id=?,name=?,service_number=?,profile_id=?,welcome_text=?,welcome_audio=?,enabled=?,revision=revision+1,fallback_target=?,updated_at=?
+            "UPDATE ai_agent SET agent_id=?,name=?,service_number=?,profile_id=?,welcome_text=?,welcome_audio=?,welcome_language=?,enabled=?,revision=revision+1,fallback_target=?,updated_at=?
              WHERE domain_id=? AND id=?",
             vec![
                 agent.agent_id.clone().into(), agent.name.clone().into(), agent.service_number.clone().into(),
-                agent.profile_id.clone().into(), agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(),
+                agent.profile_id.clone().into(), agent.welcome_text.clone().into(), agent.welcome_audio.clone().into(), agent.welcome_language.clone().into(), agent.enabled.into(), agent.fallback_target.clone().into(),
                 i64::try_from(unix_timestamp_ms())?.into(), domain_id.as_str().into(), i64::try_from(agent.id)?.into(),
             ],
         )).await?;

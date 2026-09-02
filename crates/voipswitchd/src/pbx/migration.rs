@@ -1,9 +1,10 @@
 use crate::config_service::{
-    CALL_TRACE_ENABLED_KEY, CDR_SPOOL_REJECT_MB_KEY, CDR_SPOOL_RESUME_MB_KEY,
-    CDR_SPOOL_WARNING_MB_KEY, DEFAULT_CDR_SPOOL_REJECT_MB, DEFAULT_CDR_SPOOL_RESUME_MB,
-    DEFAULT_CDR_SPOOL_WARNING_MB, DEFAULT_LOG_LEVEL, DEFAULT_RECORDING_MAX_SIZE_GB,
-    DEFAULT_RECORDING_RETENTION_DAYS, DEFAULT_SIP_PORT, LOG_LEVEL_KEY, RECORDING_DIR_KEY,
-    RECORDING_MAX_SIZE_GB_KEY, RECORDING_RETENTION_DAYS_KEY, SIP_PORT_KEY,
+    AI_WELCOME_AUDIO_DIR_KEY, CALL_TRACE_ENABLED_KEY, CDR_SPOOL_REJECT_MB_KEY,
+    CDR_SPOOL_RESUME_MB_KEY, CDR_SPOOL_WARNING_MB_KEY, DEFAULT_CDR_SPOOL_REJECT_MB,
+    DEFAULT_CDR_SPOOL_RESUME_MB, DEFAULT_CDR_SPOOL_WARNING_MB, DEFAULT_LOG_LEVEL,
+    DEFAULT_RECORDING_MAX_SIZE_GB, DEFAULT_RECORDING_RETENTION_DAYS, DEFAULT_SIP_PORT,
+    LOG_LEVEL_KEY, RECORDING_DIR_KEY, RECORDING_MAX_SIZE_GB_KEY, RECORDING_RETENTION_DAYS_KEY,
+    SIP_PORT_KEY,
 };
 use crate::pbx::domain::db::domain_record;
 use crate::pbx::global_setting::db as global_setting;
@@ -28,6 +29,7 @@ async fn seed_global_settings(conn: &DatabaseConnection) -> Result<()> {
         (SIP_PORT_KEY, DEFAULT_SIP_PORT.to_string(), "integer"),
         (LOG_LEVEL_KEY, DEFAULT_LOG_LEVEL.to_string(), "string"),
         (RECORDING_DIR_KEY, String::new(), "string"),
+        (AI_WELCOME_AUDIO_DIR_KEY, String::new(), "string"),
         (
             RECORDING_RETENTION_DAYS_KEY,
             DEFAULT_RECORDING_RETENTION_DAYS.to_string(),
@@ -220,6 +222,7 @@ async fn create_ai_agent_tables(conn: &DatabaseConnection) -> Result<()> {
             profile_id TEXT NOT NULL,
             welcome_text TEXT,
             welcome_audio BLOB,
+            welcome_language TEXT NOT NULL DEFAULT 'zh-CN',
             enabled INTEGER NOT NULL DEFAULT 1,
             revision INTEGER NOT NULL DEFAULT 1,
             fallback_target TEXT,
@@ -248,6 +251,14 @@ async fn create_ai_agent_tables(conn: &DatabaseConnection) -> Result<()> {
         conn.execute(Statement::from_string(
             DbBackend::Sqlite,
             "ALTER TABLE ai_agent ADD COLUMN welcome_audio BLOB".to_string(),
+        ))
+        .await?;
+    }
+    if !has_sqlite_column(conn, "ai_agent", "welcome_language").await? {
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ALTER TABLE ai_agent ADD COLUMN welcome_language TEXT NOT NULL DEFAULT 'zh-CN'"
+                .to_string(),
         ))
         .await?;
     }

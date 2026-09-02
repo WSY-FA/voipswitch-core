@@ -18,6 +18,7 @@ pub(crate) enum PrepareSdpPurpose {
         payload_types: Vec<u8>,
     },
     AiAgentAnswer,
+    TransferAnswer,
     CalleeAttemptOffer {
         attempt_seq: u16,
     },
@@ -113,7 +114,8 @@ impl MediaActionExecutor {
                             }
                             PrepareSdpPurpose::Provisional { .. }
                             | PrepareSdpPurpose::Answer { .. }
-                            | PrepareSdpPurpose::AiAgentAnswer => {
+                            | PrepareSdpPurpose::AiAgentAnswer
+                            | PrepareSdpPurpose::TransferAnswer => {
                                 if matches!(purpose, PrepareSdpPurpose::AiAgentAnswer) {
                                     worker_media.prepare_ai_agent_sdp(&sdp, generation).await
                                 } else {

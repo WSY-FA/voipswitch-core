@@ -13,6 +13,7 @@ pub const CALL_TRACE_ENABLED_KEY: &str = "call_trace_enabled";
 pub const SIP_PORT_KEY: &str = "sip_port";
 pub const LOG_LEVEL_KEY: &str = "log_level";
 pub const RECORDING_DIR_KEY: &str = "recording_dir";
+pub const AI_WELCOME_AUDIO_DIR_KEY: &str = "ai_welcome_audio_dir";
 pub const RECORDING_RETENTION_DAYS_KEY: &str = "recording_retention_days";
 pub const RECORDING_MAX_SIZE_GB_KEY: &str = "recording_max_size_gb";
 pub const CDR_SPOOL_WARNING_MB_KEY: &str = "cdr_spool_warning_mb";
@@ -68,6 +69,13 @@ impl RuntimeConfig {
         match self.globals.get(RECORDING_DIR_KEY) {
             Some(GlobalValue::String(path)) if !path.trim().is_empty() => PathBuf::from(path),
             _ => Path::new(&self.system.data_dir).join("recordings"),
+        }
+    }
+
+    pub fn ai_welcome_audio_dir(&self) -> PathBuf {
+        match self.globals.get(AI_WELCOME_AUDIO_DIR_KEY) {
+            Some(GlobalValue::String(path)) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => Path::new(&self.system.data_dir).join("ai-welcome-audio"),
         }
     }
 

@@ -34,7 +34,9 @@ use crate::pbx::recording::model::{RecordingDirection, RecordingTargetType};
 use crate::pbx::route::analysis::{InboundRouteTarget, analyze_inbound_route};
 use crate::runtime::adapter::AdapterRuntimeWriter;
 pub(crate) use crate::runtime::call::actor::{CalleeSessionActor, SessionActor};
-use crate::runtime::call::actor::{CoordinatorRuntimeState, InitialCallAction, PendingAnswer};
+use crate::runtime::call::actor::{
+    CoordinatorRuntimeState, InitialCallAction, PendingAnswer, spawn_builtin_prompt,
+};
 use crate::runtime::media::{DtmfSessionBindings, MediaPlaneManager};
 use crate::runtime::recording::RecordingSpec;
 use ai_protocol::control::WelcomePrompt;
@@ -634,6 +636,9 @@ impl SessionActor {
                 retry_after_cleanup: None,
                 caller_offer: event.sdp_offer.clone(),
                 route_deadline,
+                pending_ai_transfer: None,
+                ai_transfer_failed: false,
+                prompt_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
             state: state.clone(),
             action_executor,
@@ -728,7 +733,8 @@ impl SessionActor {
         if self.retry_after_late_answer()? {
             return Ok(());
         }
-        if self.call.is_answered() || self.pending_answer.is_some() {
+        let transfer_answer = self.runtime.pending_ai_transfer.is_some();
+        if (!transfer_answer && self.call.is_answered()) || self.pending_answer.is_some() {
             return Ok(());
         }
         if self.call.is_terminating() {
@@ -767,7 +773,11 @@ impl SessionActor {
         self.media_executor.prepare_sdp(
             format!("prepare-answer-{}", self.call.call_id()),
             self.media_generation,
-            PrepareSdpPurpose::Answer { payload_types },
+            if transfer_answer {
+                PrepareSdpPurpose::TransferAnswer
+            } else {
+                PrepareSdpPurpose::Answer { payload_types }
+            },
             answer,
         )?;
         Ok(())
@@ -953,9 +963,9 @@ impl SessionActor {
                     Err(error) => {
                         let command = match purpose {
                             PrepareSdpPurpose::Provisional { .. } => "CancelOutbound",
-                            PrepareSdpPurpose::Answer { .. } | PrepareSdpPurpose::AiAgentAnswer => {
-                                "HangupDialog"
-                            }
+                            PrepareSdpPurpose::Answer { .. }
+                            | PrepareSdpPurpose::AiAgentAnswer
+                            | PrepareSdpPurpose::TransferAnswer => "HangupDialog",
                             PrepareSdpPurpose::CalleeAttemptOffer { attempt_seq } => {
                                 self.handle_attempt_offer_prepared(attempt_seq, Err(error))?;
                                 return Ok(());
@@ -988,6 +998,45 @@ impl SessionActor {
                     }
                     PrepareSdpPurpose::AiAgentAnswer => {
                         self.complete_answer(prepared, Vec::new())?;
+                    }
+                    PrepareSdpPurpose::TransferAnswer => {
+                        self.answer_in_progress = false;
+                        self.runtime.ai_transfer_failed = false;
+                        self.runtime
+                            .prompt_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        self.call.state = CallState::Connected;
+                        self.call.callee_terminated = false;
+                        self.runtime
+                            .call
+                            .mark_transfer_answered(unix_timestamp_ms(), self.media_generation)
+                            .map_err(anyhow::Error::msg)?;
+                        self.media_executor.start_answer_media(
+                            format!("start-transfer-media-{}", self.call.call_id()),
+                            self.media_generation,
+                            None,
+                            self.call.call_id().to_string(),
+                            false,
+                        )?;
+                        if let Some(transfer) = self.runtime.pending_ai_transfer.take()
+                            && let Some(ai_jobs) = self.state.ai_jobs()
+                        {
+                            let _ = ai_jobs.try_stop_voice_conversation(
+                                transfer.conversation.clone(),
+                                "transfer_connected".to_string(),
+                            );
+                            ai_jobs.try_send_action_result(ai_protocol::control::ActionResult {
+                                conversation: transfer.conversation,
+                                operation_id: ai_protocol::id::OperationId::new(
+                                    transfer.operation_id,
+                                )?,
+                                generation: transfer.generation,
+                                success: true,
+                                code: "TRANSFER_CONNECTED".to_string(),
+                                message: Some(transfer.number),
+                            })?;
+                        }
+                        self.publish_call_view();
                     }
                     PrepareSdpPurpose::CalleeAttemptOffer { attempt_seq } => {
                         self.handle_attempt_offer_prepared(attempt_seq, Ok(prepared))?;
@@ -1065,6 +1114,10 @@ impl SessionActor {
     async fn handle_failed(&mut self, event: CallLegEvent) -> Result<()> {
         self.cancel_timer(CallTimerKind::Dial);
         let status_code = event.status_code.unwrap_or(480);
+        if self.runtime.pending_ai_transfer.is_some() {
+            self.fail_ai_transfer(format!("sip_{status_code}"))?;
+            return Ok(());
+        }
         if self.retry_after_attempt_ended(status_code)? {
             return Ok(());
         }
@@ -1101,8 +1154,50 @@ impl SessionActor {
         Ok(())
     }
 
+    fn fail_ai_transfer(&mut self, reason: String) -> Result<()> {
+        self.cancel_timer(CallTimerKind::Dial);
+        self.cancel_timer(CallTimerKind::Ring);
+        self.runtime
+            .prompt_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.runtime.ai_transfer_failed = true;
+        let media = self.media_executor.media_handle();
+        media.set_ai_caller_input_enabled(false);
+        let transfer = self.runtime.pending_ai_transfer.take();
+        let language = transfer
+            .as_ref()
+            .map(|item| item.language.clone())
+            .unwrap_or_else(|| self.current_ai_language());
+        spawn_builtin_prompt(
+            media,
+            self.runtime.prompt_generation.clone(),
+            false,
+            language,
+        );
+        if let Some(transfer) = transfer
+            && let Some(ai_jobs) = self.state.ai_jobs()
+        {
+            ai_jobs.try_send_action_result(ai_protocol::control::ActionResult {
+                conversation: transfer.conversation,
+                operation_id: ai_protocol::id::OperationId::new(transfer.operation_id)?,
+                generation: transfer.generation,
+                success: false,
+                code: "TRANSFER_FAILED".to_string(),
+                message: Some(reason),
+            })?;
+        }
+        self.call.callee_terminated = true;
+        self.call.last_status = Some(480);
+        self.publish_call_view();
+        Ok(())
+    }
+
     async fn handle_cancelled(&mut self, _event: CallLegEvent) -> Result<()> {
         self.cancel_timer(CallTimerKind::Dial);
+        self.runtime
+            .prompt_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.runtime.pending_ai_transfer = None;
         let should_signal_peer = !self.call.is_terminating();
         self.call.caller_terminated = true;
         self.call.state = CallState::Terminating;
@@ -1139,6 +1234,15 @@ impl SessionActor {
 
     fn handle_disconnected(&mut self, event: CallLegEvent) -> Result<()> {
         let session_id = event.session_id.as_deref();
+        if self.runtime.ai_transfer_failed && session_id != Some(self.call.caller_session_id()) {
+            return Ok(());
+        }
+        if self.runtime.pending_ai_transfer.is_some()
+            && session_id != Some(self.call.caller_session_id())
+        {
+            self.fail_ai_transfer("callee_disconnected".to_string())?;
+            return Ok(());
+        }
         if session_id == Some(self.call.callee_session_id()) && self.retry_after_cleanup.is_some() {
             self.retry_after_attempt_ended(event.status_code.unwrap_or(487))?;
             return Ok(());
@@ -1189,7 +1293,7 @@ impl SessionActor {
     }
 }
 
-fn endpoint_resolved_route(
+pub(crate) fn endpoint_resolved_route(
     state: &AppState,
     domain_id: &str,
     endpoint_id: String,

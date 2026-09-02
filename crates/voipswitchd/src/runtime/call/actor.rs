@@ -22,6 +22,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -57,6 +59,14 @@ pub(crate) struct PendingAttemptRegistration {
     pub(crate) callee_offer: SdpBody,
 }
 
+pub(crate) struct PendingAiTransfer {
+    pub(crate) conversation: ai_protocol::control::JobRef,
+    pub(crate) operation_id: String,
+    pub(crate) generation: u64,
+    pub(crate) number: String,
+    pub(crate) language: String,
+}
+
 pub(crate) struct CoordinatorRuntimeState {
     pub(crate) call: CallRuntime,
     pub(crate) actor_started: bool,
@@ -86,6 +96,9 @@ pub(crate) struct CoordinatorRuntimeState {
     pub(crate) retry_after_cleanup: Option<u16>,
     pub(crate) caller_offer: SdpBody,
     pub(crate) route_deadline: Instant,
+    pub(crate) pending_ai_transfer: Option<PendingAiTransfer>,
+    pub(crate) ai_transfer_failed: bool,
+    pub(crate) prompt_generation: Arc<AtomicU64>,
 }
 
 pub(crate) struct SessionActor {
@@ -612,13 +625,95 @@ impl SessionActor {
                     });
                     Ok((true, "DEFERRED".to_string(), None))
                 }
-                AgentAction::TransferToExtension { .. }
-                | AgentAction::TransferToBusinessTarget { .. }
-                | AgentAction::PlayText { .. } => Ok((
-                    false,
-                    "ACTION_NOT_AVAILABLE".to_string(),
-                    Some("action requires a later core capability batch".to_string()),
-                )),
+                AgentAction::TransferToExtension { number } => {
+                    if self.runtime.pending_ai_transfer.is_some() {
+                        return Ok((true, "IDEMPOTENT_REPLAY".to_string(), None));
+                    }
+                    let config = self.state.config().snapshot();
+                    let Some(domain) =
+                        config
+                            .domains
+                            .get(&voipswitch_core::types::ids::DomainId::from(
+                                self.call.domain_id().to_string(),
+                            ))
+                    else {
+                        self.start_transfer_failure_prompt(
+                            conversation.clone(),
+                            operation_id.clone(),
+                            generation,
+                            "domain_not_found",
+                        )?;
+                        return Ok((true, "DEFERRED".to_string(), None));
+                    };
+                    let Some(extension) = domain
+                        .extensions
+                        .iter()
+                        .find(|e| e.enabled && e.number == number)
+                    else {
+                        self.start_transfer_failure_prompt(
+                            conversation.clone(),
+                            operation_id.clone(),
+                            generation,
+                            "extension_not_found",
+                        )?;
+                        return Ok((true, "DEFERRED".to_string(), None));
+                    };
+                    let Some(route) = crate::runtime::call::endpoint_resolved_route(
+                        &self.state,
+                        self.call.domain_id(),
+                        extension.id.to_string(),
+                        extension.number.clone(),
+                        self.call.caller_number.clone(),
+                        extension.number.clone(),
+                    ) else {
+                        self.start_transfer_failure_prompt(
+                            conversation.clone(),
+                            operation_id.clone(),
+                            generation,
+                            "extension_unavailable",
+                        )?;
+                        return Ok((true, "DEFERRED".to_string(), None));
+                    };
+                    let Some(candidate) = route.candidates.into_iter().next() else {
+                        self.start_transfer_failure_prompt(
+                            conversation.clone(),
+                            operation_id.clone(),
+                            generation,
+                            "extension_unavailable",
+                        )?;
+                        return Ok((true, "DEFERRED".to_string(), None));
+                    };
+                    self.runtime.pending_ai_transfer = Some(PendingAiTransfer {
+                        conversation: conversation.clone(),
+                        operation_id: operation_id.to_string(),
+                        generation,
+                        number: number.clone(),
+                        language: self.current_ai_language(),
+                    });
+                    self.runtime
+                        .prompt_generation
+                        .fetch_add(1, Ordering::AcqRel);
+                    self.media_executor
+                        .media_handle()
+                        .set_ai_caller_input_enabled(false);
+                    spawn_builtin_prompt(
+                        self.media_executor.media_handle(),
+                        self.runtime.prompt_generation.clone(),
+                        true,
+                        self.current_ai_language(),
+                    );
+                    if let Err(error) = self.begin_ai_transfer_attempt(candidate) {
+                        self.fail_ai_transfer(format!("attempt_start_failed:{error}"))?;
+                    }
+                    Ok((true, "DEFERRED".to_string(), None))
+                }
+                AgentAction::TransferToBusinessTarget { .. } | AgentAction::PlayText { .. } => {
+                    Ok((
+                        false,
+                        "ACTION_NOT_AVAILABLE".to_string(),
+                        Some("action requires a later core capability batch".to_string()),
+                    ))
+                }
             }
         });
         let (success, code, message) = match result {
@@ -663,6 +758,58 @@ impl SessionActor {
             .to_string(),
         });
         Ok(())
+    }
+
+    fn start_transfer_failure_prompt(
+        &mut self,
+        conversation: ai_protocol::control::JobRef,
+        operation_id: ai_protocol::id::OperationId,
+        generation: u64,
+        reason: &str,
+    ) -> Result<()> {
+        self.runtime
+            .prompt_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let media = self.media_executor.media_handle();
+        media.set_ai_caller_input_enabled(false);
+        spawn_builtin_prompt(
+            media,
+            self.runtime.prompt_generation.clone(),
+            false,
+            self.current_ai_language(),
+        );
+        if let Some(ai_jobs) = self.state.ai_jobs() {
+            ai_jobs.try_send_action_result(ActionResult {
+                conversation,
+                operation_id,
+                generation,
+                success: false,
+                code: "TRANSFER_FAILED".to_string(),
+                message: Some(reason.to_string()),
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn current_ai_language(&self) -> String {
+        let Some(agent_id) = self.call.callee_target.strip_prefix("ai_agent:") else {
+            return "zh-CN".to_string();
+        };
+        let config = self.state.config().snapshot();
+        config
+            .domains
+            .get(&voipswitch_core::types::ids::DomainId::from(
+                self.call.domain_id().to_string(),
+            ))
+            .and_then(|domain| {
+                domain
+                    .ai_agents
+                    .iter()
+                    .find(|agent| agent.agent_id == agent_id)
+            })
+            .map(|agent| agent.welcome_language.clone())
+            .filter(|language| matches!(language.as_str(), "zh-CN" | "en-US"))
+            .unwrap_or_else(|| "zh-CN".to_string())
     }
 
     fn validate_ai_action(&self, request: &ActionRequested) -> Result<()> {
@@ -1586,6 +1733,95 @@ impl CalleeSessionActor {
         self.completed_actions
             .insert((identity.action_id.clone(), identity.generation))
     }
+}
+
+pub(crate) fn spawn_builtin_prompt(
+    media: crate::runtime::media::MediaBridgeHandle,
+    generation: Arc<AtomicU64>,
+    looping: bool,
+    language: String,
+) {
+    tokio::spawn(async move {
+        let wav: &[u8] = match (language.as_str(), looping) {
+            ("en-US", true) => {
+                include_bytes!("../../../assets/prompts/en-US/transfer_waiting.wav")
+            }
+            ("en-US", false) => {
+                include_bytes!("../../../assets/prompts/en-US/transfer_failed.wav")
+            }
+            (_, true) => include_bytes!("../../../assets/prompts/zh-CN/transfer_waiting.wav"),
+            (_, false) => include_bytes!("../../../assets/prompts/zh-CN/transfer_failed.wav"),
+        };
+        let Some(pcm) = wav_pcm_payload(wav) else {
+            warn!("invalid built-in PBX prompt WAV");
+            return;
+        };
+        let start_generation = generation.load(Ordering::Acquire);
+        let mut sequence = 40_000_u16;
+        let mut timestamp = 0_u32;
+        let ssrc = 0x5653_5058_u32;
+        loop {
+            if generation.load(Ordering::Acquire) != start_generation || media.is_stopped() {
+                return;
+            }
+            for chunk in pcm.chunks(160 * 2) {
+                if generation.load(Ordering::Acquire) != start_generation || media.is_stopped() {
+                    return;
+                }
+                let payload: Vec<u8> = chunk
+                    .chunks_exact(2)
+                    .map(|sample| pcm16_to_alaw(i16::from_le_bytes([sample[0], sample[1]])))
+                    .collect();
+                if media
+                    .send_tts_rtp(&payload, 8, timestamp, sequence, ssrc)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sequence = sequence.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(160);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !looping {
+                media.set_ai_caller_input_enabled(true);
+                return;
+            }
+        }
+    });
+}
+
+fn wav_pcm_payload(wav: &[u8]) -> Option<&[u8]> {
+    if wav.get(0..4)? != b"RIFF" || wav.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut offset: usize = 12;
+    while offset.checked_add(8)? <= wav.len() {
+        let id = &wav[offset..offset + 4];
+        let size = u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let end = offset.checked_add(8)?.checked_add(size)?.min(wav.len());
+        if id == b"data" {
+            return Some(&wav[offset + 8..end]);
+        }
+        offset = end + (size & 1);
+    }
+    None
+}
+
+fn pcm16_to_alaw(sample: i16) -> u8 {
+    let value = i32::from(sample).abs().min(32_635);
+    let sign = if sample >= 0 { 0x80 } else { 0 };
+    let exponent = if value < 256 {
+        0
+    } else {
+        ((31 - (value as u32).leading_zeros()) as i32 - 7).min(7)
+    };
+    let mantissa = if exponent == 0 {
+        (value >> 4) & 0x0f
+    } else {
+        (value >> (exponent + 3)) & 0x0f
+    };
+    (sign | ((exponent << 4) | mantissa) as u8) ^ 0x55
 }
 
 fn valid_source_event(

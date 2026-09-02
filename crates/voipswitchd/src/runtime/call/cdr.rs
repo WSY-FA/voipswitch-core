@@ -14,6 +14,7 @@ struct FinalCallSnapshot {
     caller_number: String,
     callee_number: String,
     callee_target: String,
+    ai_agent_call: bool,
     inbound_route_id: Option<String>,
     inbound_route_name: Option<String>,
     inbound_trunk_ref: Option<String>,
@@ -43,6 +44,7 @@ impl From<&CallRuntime> for FinalCallSnapshot {
             caller_number: call.caller_number.clone(),
             callee_number: call.callee_number.clone(),
             callee_target: call.callee_target.clone(),
+            ai_agent_call: call.ai_agent_call,
             inbound_route_id: call.inbound_route_id.clone(),
             inbound_route_name: call.inbound_route_name.clone(),
             inbound_trunk_ref: call.inbound_trunk_ref.clone(),
@@ -205,7 +207,7 @@ fn build_leg_cdrs(
 async fn finalize_call(state: AppState, call: FinalCallSnapshot, media: Option<MediaBridge>) {
     let call_id = call.call_id.clone();
     if let Some(ai_jobs) = state.ai_jobs()
-        && call.callee_target.starts_with("ai_agent:")
+        && call.ai_agent_call
     {
         ai_jobs.unregister_voice_coordinator(&call_id);
     }

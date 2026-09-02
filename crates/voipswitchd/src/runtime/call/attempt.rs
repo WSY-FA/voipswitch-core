@@ -63,6 +63,36 @@ impl AttemptRegistrar {
 }
 
 impl SessionActor {
+    pub(super) fn begin_ai_transfer_attempt(&mut self, candidate: OutboundCandidate) -> Result<()> {
+        if self.pending_attempt_candidate.is_some()
+            || self.pending_attempt_registration.is_some()
+            || self.runtime.pending_ai_transfer.is_none()
+        {
+            return Err(anyhow!("transfer attempt already in progress"));
+        }
+        self.cancel_timer(CallTimerKind::Dial);
+        self.cancel_timer(CallTimerKind::Ring);
+        self.cancel_timer(CallTimerKind::Cleanup);
+        let attempt_seq = self.current_attempt_seq.saturating_add(1);
+        self.pending_attempt_candidate = Some(PendingAttemptCandidate {
+            attempt_seq,
+            candidate: candidate.clone(),
+        });
+        self.media_generation = self.media_generation.saturating_add(1);
+        self.media_executor.prepare_callee_offer(
+            format!(
+                "prepare-transfer-offer-{}-{attempt_seq}",
+                self.call.call_id()
+            ),
+            self.media_generation,
+            attempt_seq,
+            self.caller_offer.clone(),
+            candidate.callee_route_target,
+        )?;
+        self.publish_call_view();
+        Ok(())
+    }
+
     pub(super) fn route_budget_remaining(&self) -> Duration {
         self.route_deadline
             .saturating_duration_since(Instant::now())
@@ -251,7 +281,11 @@ impl SessionActor {
                     call_id = self.call.call_id(),
                     attempt_seq, reason, "prepare callee attempt SDP failed"
                 );
-                self.terminate_retry_setup("attempt_media_failed")?;
+                if self.runtime.pending_ai_transfer.is_some() {
+                    self.fail_ai_transfer("attempt_media_failed".to_string())?;
+                } else {
+                    self.terminate_retry_setup("attempt_media_failed")?;
+                }
                 return Ok(());
             }
         };
@@ -307,7 +341,11 @@ impl SessionActor {
                 error = %error,
                 "register callee attempt failed"
             );
-            self.terminate_retry_setup("attempt_registration_overload")?;
+            if self.runtime.pending_ai_transfer.is_some() {
+                self.fail_ai_transfer("attempt_registration_overload".to_string())?;
+            } else {
+                self.terminate_retry_setup("attempt_registration_overload")?;
+            }
         }
         Ok(())
     }
@@ -390,7 +428,11 @@ impl SessionActor {
                     call_id = self.call.call_id(),
                     attempt_seq, session_id, reason, "callee attempt registration rejected"
                 );
-                self.terminate_retry_setup("attempt_registration_failed")?;
+                if self.runtime.pending_ai_transfer.is_some() {
+                    self.fail_ai_transfer("attempt_registration_failed".to_string())?;
+                } else {
+                    self.terminate_retry_setup("attempt_registration_failed")?;
+                }
             }
         }
         Ok(())
@@ -399,6 +441,10 @@ impl SessionActor {
     fn submit_originate(&self, candidate: &OutboundCandidate, callee_offer: SdpBody) -> Result<()> {
         let call_id = self.call.call_id().to_string();
         let attempt_seq = self.current_attempt_seq;
+        let callee_number = target_callee_number(
+            &candidate.outbound_target,
+            &self.call.config_snapshot.numbers.signaling_callee,
+        );
         match &candidate.outbound_target {
             OutboundTarget::Endpoint {
                 endpoint_id,
@@ -413,7 +459,7 @@ impl SessionActor {
                     "endpoint_number": endpoint_number,
                     "caller_number": self.call.config_snapshot.numbers.signaling_caller,
                     "caller_display_name": Value::Null,
-                    "callee_number": self.call.config_snapshot.numbers.signaling_callee,
+                    "callee_number": callee_number,
                     "sdp_offer": callee_offer,
                     "sip_metadata": {},
                     "extension_headers": {},
@@ -428,7 +474,7 @@ impl SessionActor {
                     "trunk_ref": trunk_ref,
                     "caller_number": self.call.config_snapshot.numbers.signaling_caller,
                     "caller_display_name": Value::Null,
-                    "callee_number": self.call.config_snapshot.numbers.signaling_callee,
+                    "callee_number": callee_number,
                     "sdp_offer": callee_offer,
                     "sip_metadata": {},
                     "extension_headers": {},
@@ -477,6 +523,17 @@ impl SessionActor {
     }
 }
 
+fn target_callee_number(target: &OutboundTarget, signaling_callee: &str) -> String {
+    match target {
+        OutboundTarget::Endpoint {
+            endpoint_number, ..
+        } => endpoint_number.clone(),
+        OutboundTarget::Trunk { .. } | OutboundTarget::AiAgent { .. } => {
+            signaling_callee.to_string()
+        }
+    }
+}
+
 pub(crate) fn retryable_status(status_code: u16) -> bool {
     matches!(status_code, 408 | 480 | 500 | 502 | 503 | 504)
 }
@@ -509,5 +566,22 @@ mod tests {
         for status in [401, 403, 404, 407, 410, 484, 486, 600, 603, 604, 606] {
             assert!(!retryable_status(status), "{status} should terminate");
         }
+    }
+
+    #[test]
+    fn transfer_endpoint_uses_target_number_in_originate_request() {
+        let target = OutboundTarget::Endpoint {
+            endpoint_id: "endpoint-1002".to_string(),
+            endpoint_number: "1002".to_string(),
+        };
+        assert_eq!(target_callee_number(&target, "8000"), "1002");
+    }
+
+    #[test]
+    fn trunk_originate_keeps_route_signaling_number() {
+        let target = OutboundTarget::Trunk {
+            trunk_ref: "peer:1".to_string(),
+        };
+        assert_eq!(target_callee_number(&target, "18005551212"), "18005551212");
     }
 }
