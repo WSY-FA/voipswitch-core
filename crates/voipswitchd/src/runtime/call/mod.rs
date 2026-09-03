@@ -41,8 +41,8 @@ use crate::runtime::media::{DtmfSessionBindings, MediaPlaneManager};
 use crate::runtime::recording::RecordingSpec;
 use ai_protocol::control::WelcomePrompt;
 use ai_protocol::control::{
-    AiProfileSnapshot, AudioCodec, JobRef, MediaDirection, Participant, StartConversation,
-    StreamBinding, SubmitPostCallJob,
+    AiProfileSnapshot, AudioCodec, JobRef, MediaDirection, Participant, StartAssistConversation,
+    StartConversation, StreamBinding, SubmitPostCallJob,
 };
 use ai_protocol::id::{ConversationId, JobId, OperationId, ParticipantId, StreamId, TenantId};
 use ai_protocol::media::MediaFrame;
@@ -858,6 +858,112 @@ impl SessionActor {
             warn!(call_id = self.call.call_id(), "AI service unavailable");
             return false;
         };
+        if let Some(profile) = ai_jobs.executable_realtime_assist_profile(&policy.profile_id) {
+            let Some((payload_type, codec)) =
+                payload_types
+                    .iter()
+                    .find_map(|payload_type| match payload_type {
+                        0 => Some((0, AudioCodec::Pcmu)),
+                        8 => Some((8, AudioCodec::Pcma)),
+                        _ => None,
+                    })
+            else {
+                return false;
+            };
+            let call_id = self.call.call_id().to_string();
+            let conversation = match (
+                JobId::new(format!("assist-{call_id}")),
+                TenantId::new(self.call.domain_id().to_string()),
+                ConversationId::new(call_id.clone()),
+                OperationId::new("realtime-assist-v1"),
+            ) {
+                (Ok(job_id), Ok(tenant_id), Ok(conversation_id), Ok(operation_id)) => JobRef {
+                    job_id,
+                    tenant_id,
+                    conversation_id,
+                    operation_id,
+                    generation: 1,
+                },
+                _ => return false,
+            };
+            let (caller, callee) =
+                match (ParticipantId::new("caller"), ParticipantId::new("callee")) {
+                    (Ok(caller), Ok(callee)) => (caller, callee),
+                    _ => return false,
+                };
+            let request = StartAssistConversation {
+                conversation: conversation.clone(),
+                profile,
+                participants: vec![
+                    Participant {
+                        participant_id: caller.clone(),
+                        role: "caller".to_string(),
+                        display_number: Some(
+                            self.call.config_snapshot.numbers.original_caller.clone(),
+                        ),
+                    },
+                    Participant {
+                        participant_id: callee.clone(),
+                        role: "callee".to_string(),
+                        display_number: Some(
+                            self.call.config_snapshot.numbers.original_callee.clone(),
+                        ),
+                    },
+                ],
+                streams: vec![
+                    StreamBinding {
+                        stream_id: StreamId::new("caller-assist-audio").expect("static stream id"),
+                        participant_id: caller.clone(),
+                        direction: MediaDirection::FromParticipant,
+                        codec,
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                    StreamBinding {
+                        stream_id: StreamId::new("callee-assist-audio").expect("static stream id"),
+                        participant_id: callee.clone(),
+                        direction: MediaDirection::FromParticipant,
+                        codec,
+                        sample_rate: 8_000,
+                        channels: 1,
+                    },
+                ],
+            };
+            let tap = AiMediaTapSpec {
+                job: conversation,
+                caller: AiTapStreamSpec {
+                    participant_id: caller,
+                    stream_id: StreamId::new("caller-assist-audio").expect("static stream id"),
+                    payload_type,
+                    codec,
+                    sample_rate: 8_000,
+                    channels: 1,
+                },
+                callee: AiTapStreamSpec {
+                    participant_id: callee,
+                    stream_id: StreamId::new("callee-assist-audio").expect("static stream id"),
+                    payload_type,
+                    codec,
+                    sample_rate: 8_000,
+                    channels: 1,
+                },
+                caller_input_enabled: true,
+            };
+            return match ai_jobs.try_start_realtime_assist(
+                request,
+                self.media_executor.media_handle(),
+                tap,
+            ) {
+                Ok(_) => {
+                    info!(call_id, "AI realtime assist started");
+                    true
+                }
+                Err(error) => {
+                    warn!(call_id, error = %error, "AI realtime assist start skipped");
+                    false
+                }
+            };
+        }
         let Some(profile) = ai_jobs.executable_profile(&policy.profile_id) else {
             warn!(
                 call_id = self.call.call_id(),

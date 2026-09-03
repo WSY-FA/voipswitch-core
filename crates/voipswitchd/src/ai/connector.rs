@@ -159,12 +159,36 @@ impl AiConnector {
             .map(|projection| projection.profile.clone())
     }
 
-    pub(crate) fn known_post_call_profile_enabled(&self, profile_id: &str) -> Option<bool> {
+    pub(crate) fn executable_realtime_assist_profile(
+        &self,
+        profile_id: &str,
+    ) -> Option<AiProfileSnapshot> {
+        if !self.is_control_connected() {
+            return None;
+        }
+        self.profile_catalog
+            .borrow()
+            .as_ref()?
+            .profiles
+            .iter()
+            .find(|projection| {
+                projection.profile.profile_id.as_str() == profile_id
+                    && projection.profile.pipeline_type == AiPipelineType::RealtimeAssist
+                    && projection.enabled
+                    && projection.executable
+            })
+            .map(|projection| projection.profile.clone())
+    }
+
+    pub(crate) fn known_ai_profile_enabled(&self, profile_id: &str) -> Option<bool> {
         let catalog = self.profile_catalog.borrow();
         let catalog = catalog.as_ref()?;
         Some(catalog.profiles.iter().any(|projection| {
             projection.profile.profile_id.as_str() == profile_id
-                && projection.profile.pipeline_type == AiPipelineType::PostCallAnalysis
+                && matches!(
+                    projection.profile.pipeline_type,
+                    AiPipelineType::PostCallAnalysis | AiPipelineType::RealtimeAssist
+                )
                 && projection.enabled
         }))
     }
@@ -380,7 +404,11 @@ async fn connect_control(
             connector_instance_id: connector_instance_id.clone(),
             connector_kind: "voipswitch".to_string(),
             supported_versions: vec![PROTOCOL_VERSION],
-            capabilities: vec!["audio_input".to_string(), "post_call_job".to_string()],
+            capabilities: vec![
+                "audio_input".to_string(),
+                "post_call_job".to_string(),
+                "realtime_assist".to_string(),
+            ],
         }),
     };
     tokio::time::timeout(HANDSHAKE_TIMEOUT, write_json_frame(&mut stream, &hello))

@@ -6,8 +6,8 @@ use super::{
 use crate::data_store::{AiCallResultRecord, ConfigBackend};
 use crate::runtime::media::MediaBridgeHandle;
 use ai_protocol::control::{
-    ActionResult, ControlMessage, JobRef, JobResultRequest, JobState, StartConversation,
-    StopConversation, SubmitPostCallJob,
+    ActionResult, ControlMessage, JobRef, JobResultRequest, JobState, StartAssistConversation,
+    StartConversation, StopConversation, SubmitPostCallJob,
 };
 use ai_protocol::media::MediaFrame;
 use anyhow::{Context, Result};
@@ -43,6 +43,7 @@ struct ActiveCapture {
 pub(crate) struct AiJobService {
     tx: mpsc::Sender<JobCommand>,
     active_conversations: Arc<Mutex<BTreeSet<String>>>,
+    active_assists: Arc<Mutex<BTreeMap<String, JobRef>>>,
     connector: AiConnector,
     voice_coordinators:
         Arc<Mutex<BTreeMap<String, crate::runtime::call::session::CallCoordinatorHandle>>>,
@@ -72,6 +73,7 @@ impl AiJobService {
         Self {
             tx,
             active_conversations: Arc::new(Mutex::new(BTreeSet::new())),
+            active_assists: Arc::new(Mutex::new(BTreeMap::new())),
             connector,
             voice_coordinators,
         }
@@ -103,7 +105,7 @@ impl AiJobService {
     }
 
     pub(crate) fn validate_profile_reference(&self, profile_id: &str) -> Result<()> {
-        if let Some(enabled) = self.connector.known_post_call_profile_enabled(profile_id) {
+        if let Some(enabled) = self.connector.known_ai_profile_enabled(profile_id) {
             anyhow::ensure!(
                 enabled,
                 "INVALID_REFERENCE: AI profile {profile_id} is missing or disabled"
@@ -121,6 +123,38 @@ impl AiJobService {
         profile_id: &str,
     ) -> Option<ai_protocol::control::AiProfileSnapshot> {
         self.connector.executable_voice_agent_profile(profile_id)
+    }
+
+    pub(crate) fn executable_realtime_assist_profile(
+        &self,
+        profile_id: &str,
+    ) -> Option<ai_protocol::control::AiProfileSnapshot> {
+        self.connector
+            .executable_realtime_assist_profile(profile_id)
+    }
+
+    pub(crate) fn try_start_realtime_assist(
+        &self,
+        request: StartAssistConversation,
+        media: MediaBridgeHandle,
+        tap: AiMediaTapSpec,
+    ) -> Result<AiMediaTapSender> {
+        anyhow::ensure!(
+            request.conversation == tap.job,
+            "assist tap identity mismatch"
+        );
+        self.connector
+            .try_send(ControlMessage::StartAssistConversation(request.clone()))?;
+        let sender = AiMediaTapSender::new(self.connector.clone(), tap);
+        media.enable_ai_tap(sender.clone())?;
+        self.active_assists
+            .lock()
+            .expect("AI assist map lock poisoned")
+            .insert(
+                request.conversation.conversation_id.to_string(),
+                request.conversation,
+            );
+        Ok(sender)
     }
 
     pub(crate) fn synthesize_tts(
@@ -235,6 +269,21 @@ impl AiJobService {
         conversation_id: String,
         capture: Option<AiCaptureFinalized>,
     ) -> Result<()> {
+        if let Some(conversation) = self
+            .active_assists
+            .lock()
+            .expect("AI assist map lock poisoned")
+            .remove(&conversation_id)
+        {
+            return self
+                .connector
+                .try_send(ControlMessage::StopAssistConversation(
+                    ai_protocol::control::StopAssistConversation {
+                        conversation,
+                        reason: "call_ended".to_string(),
+                    },
+                ));
+        }
         if !self
             .active_conversations
             .lock()
