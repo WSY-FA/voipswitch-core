@@ -106,9 +106,21 @@ impl SessionActor {
             CallTimerKind::Dial => {
                 if self.call.call_id() != event.call_id
                     || self.call.dial_timer_generation != event.generation
-                    || self.call.is_answered()
                     || self.call.is_terminating()
                 {
+                    return Ok(());
+                }
+                if self.runtime.pending_ai_transfer.is_some() {
+                    self.cancel_timer(CallTimerKind::Dial);
+                    self.submit_callee_action(
+                        "CancelOutbound",
+                        format!("ai-transfer-dial-timeout-{}", self.call.call_id()),
+                        json!({"reason": "dial_timeout"}),
+                    )?;
+                    self.fail_ai_transfer("dial_timeout".to_string())?;
+                    return Ok(());
+                }
+                if self.call.is_answered() {
                     return Ok(());
                 }
                 if self.wait_for_retry_cleanup(408)? {
@@ -143,9 +155,21 @@ impl SessionActor {
             CallTimerKind::Ring => {
                 if self.call.call_id() != event.call_id
                     || self.call.ring_timer_generation != event.generation
-                    || self.call.is_answered()
                     || self.call.is_terminating()
                 {
+                    return Ok(());
+                }
+                if self.runtime.pending_ai_transfer.is_some() {
+                    self.cancel_timer(CallTimerKind::Ring);
+                    self.submit_callee_action(
+                        "CancelOutbound",
+                        format!("ai-transfer-ring-timeout-{}", self.call.call_id()),
+                        json!({"reason": "ring_timeout"}),
+                    )?;
+                    self.fail_ai_transfer("ring_timeout".to_string())?;
+                    return Ok(());
+                }
+                if self.call.is_answered() {
                     return Ok(());
                 }
                 if self.wait_for_retry_cleanup(480)? {

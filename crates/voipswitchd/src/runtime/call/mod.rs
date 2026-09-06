@@ -684,6 +684,15 @@ impl SessionActor {
 
     async fn handle_provisional(&mut self, event: CallLegEvent) -> Result<()> {
         self.cancel_timer(CallTimerKind::Dial);
+        if self.runtime.pending_ai_transfer.is_some() {
+            let status_code = event.status_code.unwrap_or(180);
+            self.call.last_status = Some(status_code);
+            if matches!(status_code, 180 | 183) && self.call.ring_timer_generation == 0 {
+                self.start_timer(CallTimerKind::Ring);
+            }
+            self.publish_call_view();
+            return Ok(());
+        }
         {
             let call = &mut self.call;
             let status_code = event.status_code.unwrap_or(180);
@@ -1124,23 +1133,40 @@ impl SessionActor {
                             self.call.call_id().to_string(),
                             false,
                         )?;
-                        if let Some(transfer) = self.runtime.pending_ai_transfer.take()
-                            && let Some(ai_jobs) = self.state.ai_jobs()
-                        {
-                            let _ = ai_jobs.try_stop_voice_conversation(
-                                transfer.conversation.clone(),
-                                "transfer_connected".to_string(),
+                        if let Some(transfer) = self.runtime.pending_ai_transfer.take() {
+                            record_ai_agent_trace(
+                                &self.state,
+                                self.call.call_id(),
+                                self.call.domain_id(),
+                                self.call.caller_adapter_leg_id.as_str(),
+                                self.call.caller_session_id(),
+                                "transfer_connected",
+                                transfer.generation,
+                                json!({
+                                    "operation_id": transfer.operation_id,
+                                    "number": transfer.number,
+                                    "media_generation": self.media_generation,
+                                    "agent_revision": self.call.ai_agent_revision,
+                                }),
                             );
-                            ai_jobs.try_send_action_result(ai_protocol::control::ActionResult {
-                                conversation: transfer.conversation,
-                                operation_id: ai_protocol::id::OperationId::new(
-                                    transfer.operation_id,
-                                )?,
-                                generation: transfer.generation,
-                                success: true,
-                                code: "TRANSFER_CONNECTED".to_string(),
-                                message: Some(transfer.number),
-                            })?;
+                            if let Some(ai_jobs) = self.state.ai_jobs() {
+                                let _ = ai_jobs.try_stop_voice_conversation(
+                                    transfer.conversation.clone(),
+                                    "transfer_connected".to_string(),
+                                );
+                                ai_jobs.try_send_action_result(
+                                    ai_protocol::control::ActionResult {
+                                        conversation: transfer.conversation,
+                                        operation_id: ai_protocol::id::OperationId::new(
+                                            transfer.operation_id,
+                                        )?,
+                                        generation: transfer.generation,
+                                        success: true,
+                                        code: "TRANSFER_CONNECTED".to_string(),
+                                        message: Some(transfer.number),
+                                    },
+                                )?;
+                            }
                         }
                         self.publish_call_view();
                     }
@@ -1280,17 +1306,32 @@ impl SessionActor {
             false,
             language,
         );
-        if let Some(transfer) = transfer
-            && let Some(ai_jobs) = self.state.ai_jobs()
-        {
-            ai_jobs.try_send_action_result(ai_protocol::control::ActionResult {
-                conversation: transfer.conversation,
-                operation_id: ai_protocol::id::OperationId::new(transfer.operation_id)?,
-                generation: transfer.generation,
-                success: false,
-                code: "TRANSFER_FAILED".to_string(),
-                message: Some(reason),
-            })?;
+        if let Some(transfer) = transfer {
+            record_ai_agent_trace(
+                &self.state,
+                self.call.call_id(),
+                self.call.domain_id(),
+                self.call.caller_adapter_leg_id.as_str(),
+                self.call.caller_session_id(),
+                "transfer_failed",
+                transfer.generation,
+                json!({
+                    "operation_id": transfer.operation_id,
+                    "number": transfer.number,
+                    "reason": reason,
+                    "agent_revision": self.call.ai_agent_revision,
+                }),
+            );
+            if let Some(ai_jobs) = self.state.ai_jobs() {
+                ai_jobs.try_send_action_result(ai_protocol::control::ActionResult {
+                    conversation: transfer.conversation,
+                    operation_id: ai_protocol::id::OperationId::new(transfer.operation_id)?,
+                    generation: transfer.generation,
+                    success: false,
+                    code: "TRANSFER_FAILED".to_string(),
+                    message: Some(reason),
+                })?;
+            }
         }
         self.call.callee_terminated = true;
         self.call.last_status = Some(480);
@@ -1303,7 +1344,7 @@ impl SessionActor {
         self.runtime
             .prompt_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.runtime.pending_ai_transfer = None;
+        let transfer_pending = self.runtime.pending_ai_transfer.take().is_some();
         let should_signal_peer = !self.call.is_terminating();
         self.call.caller_terminated = true;
         self.call.state = CallState::Terminating;
@@ -1312,7 +1353,19 @@ impl SessionActor {
         if should_signal_peer {
             self.call.begin_terminating(HangupCause::InternalError);
             self.cancel_timer(CallTimerKind::Ring);
-            if self.call.callee_target.starts_with("ai_agent:") {
+            if transfer_pending {
+                let command = if self.answer_in_progress {
+                    "HangupDialog"
+                } else {
+                    "CancelOutbound"
+                };
+                self.submit_callee_action(
+                    command,
+                    format!("cancel-ai-transfer-{}", self.call.call_id()),
+                    json!({}),
+                )?;
+                start_cleanup_timer = true;
+            } else if self.ai_agent_conversation_active() {
                 self.call.callee_terminated = true;
             } else {
                 let (command, action_id) = if self.call.is_answered() {
@@ -1372,7 +1425,19 @@ impl SessionActor {
             let peer_is_callee = session_id == Some(self.call.caller_session_id());
             let call_id = self.call.call_id().to_string();
             if peer_is_callee {
-                if self.call.callee_target.starts_with("ai_agent:") {
+                if self.runtime.pending_ai_transfer.is_some() {
+                    let command = if self.answer_in_progress {
+                        "HangupDialog"
+                    } else {
+                        "CancelOutbound"
+                    };
+                    self.runtime.pending_ai_transfer = None;
+                    self.submit_callee_action(
+                        command,
+                        format!("hangup-ai-transfer-{call_id}"),
+                        json!({}),
+                    )?;
+                } else if self.ai_agent_conversation_active() {
                     self.call.callee_terminated = true;
                 } else {
                     self.submit_callee_action(

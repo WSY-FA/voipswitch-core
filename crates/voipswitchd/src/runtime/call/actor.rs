@@ -11,6 +11,7 @@ use crate::runtime::call::event::{
 };
 use crate::runtime::call::media_action::MediaActionExecutor;
 use crate::runtime::call::model::{CallRuntime, OutboundCandidate};
+use crate::runtime::call::record_ai_agent_trace;
 use crate::runtime::call::registry::LegEventDeduper;
 use crate::runtime::call::session::{
     CallCoordinatorHandle, ControlMessage, CoordinatorHandoffToken, CoordinatorIdentity,
@@ -641,6 +642,7 @@ impl SessionActor {
                             conversation.clone(),
                             operation_id.clone(),
                             generation,
+                            &number,
                             "domain_not_found",
                         )?;
                         return Ok((true, "DEFERRED".to_string(), None));
@@ -654,6 +656,7 @@ impl SessionActor {
                             conversation.clone(),
                             operation_id.clone(),
                             generation,
+                            &number,
                             "extension_not_found",
                         )?;
                         return Ok((true, "DEFERRED".to_string(), None));
@@ -670,6 +673,7 @@ impl SessionActor {
                             conversation.clone(),
                             operation_id.clone(),
                             generation,
+                            &number,
                             "extension_unavailable",
                         )?;
                         return Ok((true, "DEFERRED".to_string(), None));
@@ -679,6 +683,7 @@ impl SessionActor {
                             conversation.clone(),
                             operation_id.clone(),
                             generation,
+                            &number,
                             "extension_unavailable",
                         )?;
                         return Ok((true, "DEFERRED".to_string(), None));
@@ -765,6 +770,7 @@ impl SessionActor {
         conversation: ai_protocol::control::JobRef,
         operation_id: ai_protocol::id::OperationId,
         generation: u64,
+        number: &str,
         reason: &str,
     ) -> Result<()> {
         self.runtime
@@ -777,6 +783,21 @@ impl SessionActor {
             self.runtime.prompt_generation.clone(),
             false,
             self.current_ai_language(),
+        );
+        record_ai_agent_trace(
+            &self.state,
+            self.call.call_id(),
+            self.call.domain_id(),
+            self.call.caller_adapter_leg_id.as_str(),
+            self.call.caller_session_id(),
+            "transfer_failed",
+            generation,
+            json!({
+                "operation_id": operation_id,
+                "number": number,
+                "reason": reason,
+                "agent_revision": self.call.ai_agent_revision,
+            }),
         );
         if let Some(ai_jobs) = self.state.ai_jobs() {
             ai_jobs.try_send_action_result(ActionResult {
@@ -792,7 +813,7 @@ impl SessionActor {
     }
 
     pub(super) fn current_ai_language(&self) -> String {
-        let Some(agent_id) = self.call.callee_target.strip_prefix("ai_agent:") else {
+        let Some(agent_id) = self.call.original_ai_agent_id() else {
             return "zh-CN".to_string();
         };
         let config = self.state.config().snapshot();
@@ -831,7 +852,7 @@ impl SessionActor {
             "action deadline exceeded"
         );
         anyhow::ensure!(
-            self.call.callee_target.starts_with("ai_agent:") && self.call.is_answered(),
+            self.ai_agent_conversation_active() && self.call.is_answered(),
             "AI action is only valid on an answered AI Agent call"
         );
         anyhow::ensure!(!self.call.is_terminating(), "call is terminating");
@@ -839,7 +860,7 @@ impl SessionActor {
     }
 
     fn handle_ai_gateway_unavailable(&mut self) -> Result<()> {
-        if !self.call.callee_target.starts_with("ai_agent:") || self.call.is_terminating() {
+        if !self.ai_agent_conversation_active() || self.call.is_terminating() {
             return Ok(());
         }
         let fallback_target = self
@@ -895,6 +916,14 @@ impl SessionActor {
             "AI gateway unavailable; AI call fallback ended call"
         );
         Ok(())
+    }
+
+    pub(super) fn ai_agent_conversation_active(&self) -> bool {
+        ai_agent_conversation_active(
+            &self.call.callee_target,
+            self.runtime.pending_ai_transfer.is_some(),
+            self.runtime.ai_transfer_failed,
+        )
     }
 
     async fn handle_caller_leg_event(
@@ -1331,6 +1360,13 @@ impl SessionActor {
         }
         if peer_failure
             && failure.identity.action_kind.starts_with("Originate")
+            && self.runtime.pending_ai_transfer.is_some()
+        {
+            self.fail_ai_transfer(format!("originate_failed:{}", failure.reason))?;
+            return Ok(());
+        }
+        if peer_failure
+            && failure.identity.action_kind.starts_with("Originate")
             && self.retry_after_originate_failure()?
         {
             return Ok(());
@@ -1421,6 +1457,14 @@ fn dtmf_digits_to_string(digits: &[DtmfDigit]) -> String {
             DtmfDigit::Flash => 'F',
         })
         .collect()
+}
+
+fn ai_agent_conversation_active(
+    callee_target: &str,
+    transfer_pending: bool,
+    transfer_failed: bool,
+) -> bool {
+    callee_target.starts_with("ai_agent:") || transfer_pending || transfer_failed
 }
 
 impl CalleeSessionActor {
@@ -1905,6 +1949,18 @@ mod tests {
             source_generation: DtmfSourceGeneration::Media(1),
             incomplete_end: false,
         }
+    }
+
+    #[test]
+    fn failed_transfer_keeps_ai_conversation_active_until_a_transfer_connects() {
+        assert!(ai_agent_conversation_active(
+            "ai_agent:frontdesk",
+            false,
+            false
+        ));
+        assert!(ai_agent_conversation_active("ext:1002", true, false));
+        assert!(ai_agent_conversation_active("ext:1002", false, true));
+        assert!(!ai_agent_conversation_active("ext:1002", false, false));
     }
 
     #[tokio::test]

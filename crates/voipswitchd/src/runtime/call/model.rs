@@ -50,6 +50,16 @@ pub(crate) struct CallRuntime {
 }
 
 impl CallRuntime {
+    pub(crate) fn original_ai_agent_id(&self) -> Option<&str> {
+        self.config_snapshot
+            .candidates
+            .first()
+            .and_then(|candidate| match &candidate.outbound_target {
+                OutboundTarget::AiAgent { agent_id } => Some(agent_id.as_str()),
+                _ => None,
+            })
+    }
+
     pub(crate) fn new(
         call_id: String,
         caller_session_id: String,
@@ -355,7 +365,9 @@ impl CallRuntime {
         media_generation: u64,
     ) -> Result<(), String> {
         self.update_current_attempt(CalleeAttemptState::Answered, None)?;
-        self.select_current_attempt(answered_at_ms)?;
+        self.aggregate
+            .replace_winner(&self.current_attempt_id, answered_at_ms)
+            .map_err(|error| error.to_string())?;
         self.aggregate.release_all_bridges(answered_at_ms);
         self.caller.state = LegState::Bridged;
         self.aggregate

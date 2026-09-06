@@ -532,6 +532,47 @@ impl CallAggregate {
         })
     }
 
+    /// Replace an already selected winner during an attended transfer.
+    ///
+    /// Ordinary hunt selection remains single-winner and continues to reject
+    /// a second winner through `select_winner`; an explicit transfer is the
+    /// only operation allowed to move the winner to a new answered attempt.
+    pub fn replace_winner(
+        &mut self,
+        attempt_id: &CalleeAttemptId,
+        answered_at_ms: u64,
+    ) -> Result<WinnerSelection, CallError> {
+        let previous_winner = self.winner.clone();
+        if previous_winner.as_ref() == Some(attempt_id) {
+            return self.select_winner(attempt_id, answered_at_ms);
+        }
+        let winner_session_id = {
+            let attempt = self
+                .callee_attempts
+                .get_mut(attempt_id)
+                .ok_or_else(|| CallError::AttemptNotFound(attempt_id.clone()))?;
+            if attempt.state != CalleeAttemptState::Answered {
+                return Err(CallError::AttemptNotAnswered(attempt_id.clone()));
+            }
+            attempt.state = CalleeAttemptState::Selected;
+            attempt.session_id.clone()
+        };
+        let mut cancelled_sessions = Vec::new();
+        for (other_id, attempt) in &mut self.callee_attempts {
+            if other_id == attempt_id || attempt.state.is_terminal() {
+                continue;
+            }
+            attempt.state = CalleeAttemptState::Cancelled;
+            cancelled_sessions.push(attempt.session_id.clone());
+        }
+        self.winner = Some(attempt_id.clone());
+        self.answered_at_ms.get_or_insert(answered_at_ms);
+        Ok(WinnerSelection {
+            winner_session_id,
+            cancelled_sessions,
+        })
+    }
+
     pub fn snapshot(&self) -> CallSnapshot {
         CallSnapshot {
             id: self.id.clone(),
@@ -726,6 +767,49 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn attended_transfer_replaces_existing_winner() {
+        let caller = caller("domain-a", "call-transfer");
+        let mut call = CallAggregate::new(
+            &caller,
+            BridgePolicy::ParallelFirstAnswer,
+            1,
+            CallContext::new(),
+        )
+        .unwrap();
+        let (first, first_target) = callee(&caller, "1", "1001");
+        let (second, second_target) = callee(&caller, "2", "1002");
+        let first_attempt = match &first.role {
+            LegRole::Callee { attempt_id } => attempt_id.clone(),
+            LegRole::Caller => unreachable!(),
+        };
+        let second_attempt = match &second.role {
+            LegRole::Callee { attempt_id } => attempt_id.clone(),
+            LegRole::Caller => unreachable!(),
+        };
+        call.add_leg(&first).unwrap();
+        call.add_callee_attempt(first_attempt.clone(), first.id.clone(), first_target)
+            .unwrap();
+        call.update_attempt_state(&first_attempt, CalleeAttemptState::Dialing, None)
+            .unwrap();
+        call.update_attempt_state(&first_attempt, CalleeAttemptState::Answered, None)
+            .unwrap();
+        call.select_winner(&first_attempt, 100).unwrap();
+
+        call.add_leg(&second).unwrap();
+        call.add_callee_attempt(second_attempt.clone(), second.id.clone(), second_target)
+            .unwrap();
+        call.update_attempt_state(&second_attempt, CalleeAttemptState::Dialing, None)
+            .unwrap();
+        call.update_attempt_state(&second_attempt, CalleeAttemptState::Answered, None)
+            .unwrap();
+        let selection = call.replace_winner(&second_attempt, 200).unwrap();
+
+        assert_eq!(selection.winner_session_id, second.id);
+        assert_eq!(selection.cancelled_sessions, vec![first.id]);
+        assert_eq!(call.snapshot().winner, Some(second_attempt));
     }
 
     #[test]
