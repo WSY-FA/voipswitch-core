@@ -12,6 +12,20 @@ use voipswitch_core::media::MediaForwardingMode;
 
 pub use seaorm::SeaOrmConfigBackend;
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiOpsTaskRecord {
+    pub task_id: String,
+    pub request_id: String,
+    pub domain_id: Option<String>,
+    pub task_kind: String,
+    pub state: String,
+    pub created_at_ms: u64,
+    pub deadline_ms: u64,
+    pub cancelled_at_ms: Option<u64>,
+    pub error_code: Option<String>,
+}
+
 pub trait ConfigBackend: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn load_runtime_config(&self) -> Result<RuntimeConfig>;

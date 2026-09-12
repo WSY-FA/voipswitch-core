@@ -21,6 +21,16 @@ impl ApiCommandHandler for ShowApiCommand {
         };
 
         match topic.as_str() {
+            "health-snapshot" => Ok(object_result(
+                "health snapshot",
+                json!({
+                    "resource": "health_snapshot",
+                    "data": crate::ai_ops::health_snapshot_value(
+                        state,
+                        command.domain_id.as_ref().map(DomainId::as_str),
+                    )
+                }),
+            )),
             "status" => {
                 let config = state.config().snapshot();
                 let mut items = BTreeMap::new();
@@ -377,5 +387,20 @@ mod tests {
         };
         assert_eq!(value["data"]["available"], false);
         assert_eq!(value["data"]["profiles"], json!([]));
+    }
+
+    #[test]
+    fn health_snapshot_is_structured_and_domain_scoped() {
+        let result = ShowApiCommand
+            .handle(&state(), &command("health-snapshot", &[], Some("domain-1")))
+            .unwrap();
+        let CommandRenderData::Object { value } = result.data else {
+            panic!("health snapshot must use object rendering");
+        };
+        assert_eq!(value["data"]["schema_version"], 1);
+        assert_eq!(value["data"]["domain_id"], "domain-1");
+        assert_eq!(value["data"]["truncated"], false);
+        assert!(value["data"]["component_health"]["voipswitchd"] == "up");
+        assert!(value["data"]["system_metrics"]["active_call_count"].is_number());
     }
 }

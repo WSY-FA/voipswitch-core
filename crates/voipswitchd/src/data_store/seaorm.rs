@@ -25,6 +25,7 @@ pub struct SeaOrmConfigBackend {
 }
 
 impl SeaOrmConfigBackend {
+    #[allow(dead_code)]
     pub fn sqlite(data_dir: impl Into<PathBuf>, instance_id: impl Into<String>) -> Result<Self> {
         Ok(Self {
             data_dir: data_dir.into(),
@@ -59,7 +60,9 @@ impl SeaOrmConfigBackend {
     pub(crate) async fn open_system_db(&self) -> Result<DatabaseConnection> {
         fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("create data dir {}", self.data_dir.display()))?;
-        connect_sqlite(&self.system_db_path()).await
+        let conn = connect_sqlite(&self.system_db_path()).await?;
+        ensure_ai_ops_schema(&conn).await?;
+        Ok(conn)
     }
 
     fn domain_cdr_path(&self, domain_id: &str) -> PathBuf {
@@ -78,6 +81,7 @@ impl SeaOrmConfigBackend {
         ensure_recording_schema(&conn).await?;
         ensure_leg_cdr_schema(&conn).await?;
         ensure_ai_result_schema(&conn).await?;
+        ensure_ai_ops_schema(&conn).await?;
         Ok(conn)
     }
 
@@ -735,6 +739,87 @@ impl ConfigBackend for SeaOrmConfigBackend {
                 for statement in trace_retention_statements() {
                     txn.execute(statement).await?;
                 }
+            }
+            txn.commit().await?;
+            Ok(())
+        })
+    }
+}
+
+impl SeaOrmConfigBackend {
+    pub fn create_ai_ops_task(&self, task: &super::AiOpsTaskRecord) -> Result<bool> {
+        self.block_on(async {
+            let conn = self.open_system_db().await?;
+            let result = conn.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT OR IGNORE INTO ai_ops_task (task_id,request_id,domain_id,task_kind,state,created_at_ms,deadline_ms,cancelled_at_ms,error_code) VALUES (?,?,?,?,?,?,?,?,?)",
+                vec![task.task_id.clone().into(),task.request_id.clone().into(),task.domain_id.clone().into(),task.task_kind.clone().into(),task.state.clone().into(),as_i64(task.created_at_ms)?.into(),as_i64(task.deadline_ms)?.into(),task.cancelled_at_ms.map(as_i64).transpose()?.into(),task.error_code.clone().into()])).await?;
+            Ok(result.rows_affected() == 1)
+        })
+    }
+
+    pub fn get_ai_ops_task_by_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<super::AiOpsTaskRecord>> {
+        self.block_on(async {
+            let conn = self.open_system_db().await?;
+            let row = conn.query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT task_id,request_id,domain_id,task_kind,state,created_at_ms,deadline_ms,cancelled_at_ms,error_code FROM ai_ops_task WHERE request_id=?",
+                vec![request_id.into()])).await?;
+            row.map(|r| Ok(super::AiOpsTaskRecord {
+                task_id: r.try_get("", "task_id")?, request_id: r.try_get("", "request_id")?,
+                domain_id: r.try_get("", "domain_id")?, task_kind: r.try_get("", "task_kind")?,
+                state: r.try_get("", "state")?, created_at_ms: r.try_get::<i64>("", "created_at_ms")? as u64,
+                deadline_ms: r.try_get::<i64>("", "deadline_ms")? as u64,
+                cancelled_at_ms: r.try_get::<Option<i64>>("", "cancelled_at_ms")?.map(|v| v as u64),
+                error_code: r.try_get("", "error_code")?,
+            })).transpose()
+        })
+    }
+
+    pub fn update_ai_ops_task_state(
+        &self,
+        task_id: &str,
+        state: &str,
+        error_code: Option<&str>,
+        cancelled_at_ms: Option<u64>,
+    ) -> Result<bool> {
+        self.block_on(async {
+            let conn = self.open_system_db().await?;
+            let result = conn
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE ai_ops_task SET state=?,error_code=?,cancelled_at_ms=? WHERE task_id=?",
+                    vec![
+                        state.into(),
+                        error_code.map(str::to_owned).into(),
+                        cancelled_at_ms.map(as_i64).transpose()?.into(),
+                        task_id.into(),
+                    ],
+                ))
+                .await?;
+            Ok(result.rows_affected() == 1)
+        })
+    }
+
+    pub fn persist_ai_ops_result(
+        &self,
+        task_id: &str,
+        domain_id: Option<&str>,
+        result_json: &str,
+        evidence_digest: &str,
+        created_at_ms: u64,
+        evidence: &[(String, String, String)],
+    ) -> Result<()> {
+        self.block_on(async {
+            let conn = self.open_system_db().await?;
+            let txn = conn.begin().await?;
+            txn.execute(Statement::from_sql_and_values(DbBackend::Sqlite, "INSERT OR REPLACE INTO ai_ops_result (task_id,domain_id,result_json,evidence_digest,created_at_ms) VALUES (?,?,?,?,?)", vec![task_id.into(), domain_id.map(str::to_owned).into(), result_json.into(), evidence_digest.into(), as_i64(created_at_ms)?.into()])).await?;
+            txn.execute(Statement::from_sql_and_values(DbBackend::Sqlite, "DELETE FROM ai_ops_evidence WHERE task_id=?", vec![task_id.into()])).await?;
+            for (id, kind, summary) in evidence.iter().take(256) {
+                txn.execute(Statement::from_sql_and_values(DbBackend::Sqlite, "INSERT INTO ai_ops_evidence (task_id,evidence_id,kind,summary) VALUES (?,?,?,?)", vec![task_id.into(), id.clone().into(), kind.clone().into(), summary.clone().into()])).await?;
             }
             txn.commit().await?;
             Ok(())
@@ -1588,6 +1673,42 @@ async fn ensure_ai_result_schema(conn: &DatabaseConnection) -> Result<()> {
             ON ai_call_result(call_id,result_version DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_call_result_received
             ON ai_call_result(received_at_ms DESC,job_id);
+        "#,
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn ensure_ai_ops_schema(conn: &DatabaseConnection) -> Result<()> {
+    conn.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_ops_task (
+            task_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            domain_id TEXT,
+            task_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            deadline_ms INTEGER NOT NULL,
+            cancelled_at_ms INTEGER,
+            error_code TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_ops_task_created ON ai_ops_task(created_at_ms DESC);
+        CREATE TABLE IF NOT EXISTS ai_ops_result (
+            task_id TEXT PRIMARY KEY,
+            domain_id TEXT,
+            result_json TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_ops_evidence (
+            task_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            PRIMARY KEY(task_id, evidence_id)
+        );
         "#,
     ))
     .await?;
