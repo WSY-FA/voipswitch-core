@@ -779,6 +779,25 @@ impl SeaOrmConfigBackend {
         })
     }
 
+    pub fn get_ai_ops_task(&self, task_id: &str) -> Result<Option<super::AiOpsTaskRecord>> {
+        self.block_on(async {
+            let conn = self.open_system_db().await?;
+            let row = conn.query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT task_id,request_id,domain_id,task_kind,state,created_at_ms,deadline_ms,cancelled_at_ms,error_code FROM ai_ops_task WHERE task_id=?",
+                vec![task_id.into()],
+            )).await?;
+            row.map(|r| Ok(super::AiOpsTaskRecord {
+                task_id: r.try_get("", "task_id")?, request_id: r.try_get("", "request_id")?,
+                domain_id: r.try_get("", "domain_id")?, task_kind: r.try_get("", "task_kind")?,
+                state: r.try_get("", "state")?, created_at_ms: r.try_get::<i64>("", "created_at_ms")? as u64,
+                deadline_ms: r.try_get::<i64>("", "deadline_ms")? as u64,
+                cancelled_at_ms: r.try_get::<Option<i64>>("", "cancelled_at_ms")?.map(|v| v as u64),
+                error_code: r.try_get("", "error_code")?,
+            })).transpose()
+        })
+    }
+
     pub fn update_ai_ops_task_state(
         &self,
         task_id: &str,
@@ -2361,6 +2380,54 @@ mod tests {
                 .expect("trace should exist")
                 .incomplete
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ai_ops_task_is_idempotent_and_result_is_transactional() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let backend = SeaOrmConfigBackend::sqlite(temp.path(), "test")?;
+        let task = crate::data_store::AiOpsTaskRecord {
+            task_id: "ops-task-1".into(),
+            request_id: "req-1".into(),
+            domain_id: Some("domain-a".into()),
+            task_kind: "health_review".into(),
+            state: "queued".into(),
+            created_at_ms: 10,
+            deadline_ms: 1000,
+            cancelled_at_ms: None,
+            error_code: None,
+        };
+        assert!(backend.create_ai_ops_task(&task)?);
+        assert!(!backend.create_ai_ops_task(&task)?);
+        assert_eq!(
+            backend.get_ai_ops_task_by_request("req-1")?,
+            Some(task.clone())
+        );
+        assert_eq!(backend.get_ai_ops_task("ops-task-1")?, Some(task));
+        assert!(backend.update_ai_ops_task_state("ops-task-1", "running", None, None)?);
+        assert_eq!(
+            backend.get_ai_ops_task("ops-task-1")?.unwrap().state,
+            "running"
+        );
+        assert!(backend.update_ai_ops_task_state(
+            "ops-task-1",
+            "cancelled",
+            Some("CANCELLED"),
+            Some(30)
+        )?);
+        let cancelled = backend.get_ai_ops_task("ops-task-1")?.unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(cancelled.error_code.as_deref(), Some("CANCELLED"));
+        assert_eq!(cancelled.cancelled_at_ms, Some(30));
+        backend.persist_ai_ops_result(
+            "ops-task-1",
+            Some("domain-a"),
+            "{\"ok\":true}",
+            "digest",
+            20,
+            &[("e1".into(), "cdr".into(), "redacted".into())],
+        )?;
         Ok(())
     }
 }
