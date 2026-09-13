@@ -10,6 +10,7 @@ use ai_protocol::control::{
     StartConversation, StopConversation, SubmitPostCallJob,
 };
 use ai_protocol::media::MediaFrame;
+use ai_protocol::time::unix_timestamp_ms;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -588,6 +589,66 @@ async fn handle_event(
             }
             _ => {}
         },
+        ControlMessage::LlmTaskCompleted(completed) => {
+            if completed.task_id.is_empty() || completed.request_id.is_empty() {
+                anyhow::bail!("AI-04 result missing task or request id");
+            }
+            if completed.result_json.len() > 262_144 {
+                anyhow::bail!("AI-04 result exceeds bounded size");
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(&completed.result_json).context("decode AI-04 result JSON")?;
+            let domain_id = parsed.get("domain_id").and_then(serde_json::Value::as_str);
+            let evidence = parsed
+                .get("evidence")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(256)
+                        .filter_map(|item| {
+                            Some((
+                                item.get("id")?.as_str()?.to_owned(),
+                                item.get("kind")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_owned(),
+                                item.get("summary")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned(),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(backend) = backend
+                .as_any()
+                .downcast_ref::<crate::data_store::SeaOrmConfigBackend>()
+            {
+                backend.persist_ai_ops_result(
+                    &completed.task_id,
+                    domain_id,
+                    &completed.result_json,
+                    &completed.evidence_digest,
+                    unix_timestamp_ms(),
+                    &evidence,
+                )?;
+                let final_state = if completed.status == "failed" {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                let code = (completed.status == "failed").then_some("MODEL_ERROR");
+                let _ = backend.update_ai_ops_task_state(
+                    &completed.task_id,
+                    final_state,
+                    code,
+                    None,
+                )?;
+            }
+            info!(task_id = %completed.task_id, status = %completed.status, "AI-04 task completed");
+        }
         ControlMessage::Error(error) => {
             warn!(
                 code = error.code,
