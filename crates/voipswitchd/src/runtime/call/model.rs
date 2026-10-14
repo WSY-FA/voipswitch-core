@@ -364,6 +364,17 @@ impl CallRuntime {
         answered_at_ms: u64,
         media_generation: u64,
     ) -> Result<(), String> {
+        let previous = self.aggregate.snapshot();
+        if let Some(winner) = previous.winner
+            && let Some(attempt) = previous
+                .callee_attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == winner)
+        {
+            self.aggregate
+                .mark_leg_left(&attempt.session_id, answered_at_ms)
+                .map_err(|error| error.to_string())?;
+        }
         self.update_current_attempt(CalleeAttemptState::Answered, None)?;
         self.aggregate
             .replace_winner(&self.current_attempt_id, answered_at_ms)

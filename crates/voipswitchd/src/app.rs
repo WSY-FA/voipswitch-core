@@ -38,6 +38,8 @@ struct AppStateInner {
     adapter_runtime: RwLock<AdapterRuntimeSummary>,
     started_at_ms: u64,
     adapter_clients: AtomicUsize,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    finalizers: AtomicUsize,
 }
 
 impl AppState {
@@ -59,7 +61,41 @@ impl AppState {
                 adapter_runtime: RwLock::new(AdapterRuntimeSummary::default()),
                 started_at_ms,
                 adapter_clients: AtomicUsize::new(0),
+                shutdown: tokio::sync::watch::channel(false).0,
+                finalizers: AtomicUsize::new(0),
             }),
+        }
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.inner.shutdown.send_replace(true);
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        *self.inner.shutdown.borrow()
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.shutdown.subscribe()
+    }
+
+    pub(crate) fn track_finalizer(&self) -> FinalizerGuard {
+        self.inner.finalizers.fetch_add(1, Ordering::SeqCst);
+        FinalizerGuard(self.clone())
+    }
+
+    pub(crate) async fn drain_finalizers(&self) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.inner.finalizers.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            error!(
+                pending = self.inner.finalizers.load(Ordering::SeqCst),
+                "shutdown deadline: call finalizers remain without durable completion"
+            );
         }
     }
 
@@ -696,4 +732,12 @@ pub struct TrunkHealthChanged {
 pub enum TrunkHealthState {
     Up,
     Down,
+}
+
+pub(crate) struct FinalizerGuard(AppState);
+
+impl Drop for FinalizerGuard {
+    fn drop(&mut self) {
+        self.0.inner.finalizers.fetch_sub(1, Ordering::SeqCst);
+    }
 }

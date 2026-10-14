@@ -6,6 +6,8 @@ use crate::runtime::call::model::CallRuntime;
 use crate::runtime::call::session::ControlMessage;
 use crate::runtime::media::{MediaBridge, MediaStatsSnapshot};
 use tracing::{info, warn};
+use voipswitch_core::call::CallSnapshot;
+use voipswitch_core::session::SessionEndpoint;
 use voipswitch_core::types::time::unix_timestamp_ms;
 
 struct FinalCallSnapshot {
@@ -13,6 +15,7 @@ struct FinalCallSnapshot {
     domain_id: String,
     caller_number: String,
     callee_number: String,
+    topology: CallSnapshot,
     callee_target: String,
     ai_agent_call: bool,
     inbound_route_id: Option<String>,
@@ -32,8 +35,6 @@ struct FinalCallSnapshot {
     recording_start_error: Option<String>,
     caller_session_id: String,
     callee_session_id: String,
-    callee_endpoint_ref: Option<String>,
-    callee_endpoint_number: Option<String>,
 }
 
 impl From<&CallRuntime> for FinalCallSnapshot {
@@ -43,6 +44,7 @@ impl From<&CallRuntime> for FinalCallSnapshot {
             domain_id: call.domain_id().to_string(),
             caller_number: call.caller_number.clone(),
             callee_number: call.callee_number.clone(),
+            topology: call.aggregate.snapshot(),
             callee_target: call.callee_target.clone(),
             ai_agent_call: call.ai_agent_call,
             inbound_route_id: call.inbound_route_id.clone(),
@@ -62,18 +64,6 @@ impl From<&CallRuntime> for FinalCallSnapshot {
             recording_start_error: call.recording_start_error.clone(),
             caller_session_id: call.caller_session_id().to_string(),
             callee_session_id: call.callee_session_id().to_string(),
-            callee_endpoint_ref: if call.outbound_trunk_ref.is_some() {
-                call.outbound_trunk_ref.clone()
-            } else {
-                call.callee_target
-                    .strip_prefix("endpoint:")
-                    .map(|s| s.to_string())
-            },
-            callee_endpoint_number: if call.outbound_trunk_ref.is_some() {
-                None
-            } else {
-                Some(call.callee_number.clone())
-            },
         }
     }
 }
@@ -125,7 +115,9 @@ impl SessionActor {
         let control_tx = self.coordinator_handle.weak_control_sender();
         let dispatcher = self.control_dispatcher.clone();
         let session_id = self.call.caller_session_id().to_string();
+        let guard = state.track_finalizer();
         tokio::spawn(async move {
+            let _guard = guard;
             finalize_call(state, snapshot, media).await;
             if let Some(control_tx) = control_tx.upgrade() {
                 let _ = dispatcher
@@ -153,55 +145,105 @@ fn build_leg_cdrs(
         }
     });
 
-    let caller_leg = LegCdrRecord {
-        call_id: call.call_id.clone(),
-        session_id: call.caller_session_id.clone(),
-        domain_id: call.domain_id.clone(),
-        leg_role: "caller".to_string(),
-        direction: "inbound".to_string(),
-        endpoint_ref: call.inbound_trunk_ref.clone(),
-        endpoint_number: Some(call.caller_number.clone()),
-        signaling_number: Some(call.caller_number.clone()),
-        route_id: call.inbound_route_id.clone(),
-        route_name: call.inbound_route_name.clone(),
-        trunk_ref: call.inbound_trunk_ref.clone(),
-        trunk_name: call.inbound_trunk_name.clone(),
-        joined_at_ms: call.started_at_ms,
-        answered_at_ms: call.answered_at_ms,
-        left_at_ms: ended_at_ms,
-        final_status: call.last_status,
-        hangup_cause: Some(hangup.clone()),
-        media_packets: total_packets,
-        media_bytes: total_bytes,
-        media_rtcp_packets: total_rtcp,
-        bridge_ids: call.callee_session_id.clone(),
-    };
-
-    let callee_leg = LegCdrRecord {
-        call_id: call.call_id.clone(),
-        session_id: call.callee_session_id.clone(),
-        domain_id: call.domain_id.clone(),
-        leg_role: "callee".to_string(),
-        direction: "outbound".to_string(),
-        endpoint_ref: call.callee_endpoint_ref.clone(),
-        endpoint_number: call.callee_endpoint_number.clone(),
-        signaling_number: Some(call.callee_number.clone()),
-        route_id: call.outbound_route_id.clone(),
-        route_name: call.outbound_route_name.clone(),
-        trunk_ref: call.outbound_trunk_ref.clone(),
-        trunk_name: call.outbound_trunk_name.clone(),
-        joined_at_ms: call.started_at_ms,
-        answered_at_ms: call.answered_at_ms,
-        left_at_ms: ended_at_ms,
-        final_status: call.last_status,
-        hangup_cause: Some(hangup),
-        media_packets: total_packets,
-        media_bytes: total_bytes,
-        media_rtcp_packets: total_rtcp,
-        bridge_ids: call.caller_session_id.clone(),
-    };
-
-    vec![caller_leg, callee_leg]
+    call.topology
+        .legs
+        .iter()
+        .filter_map(|leg| {
+            let caller = leg.session_id.as_str() == call.caller_session_id;
+            let bridges: Vec<_> = call
+                .topology
+                .bridges
+                .iter()
+                .filter(|bridge| {
+                    bridge.active_at_ms.is_some()
+                        && (bridge.leg_a == leg.session_id || bridge.leg_b == leg.session_id)
+                })
+                .collect();
+            if !caller && bridges.is_empty() {
+                return None;
+            }
+            let current = leg.session_id.as_str() == call.callee_session_id;
+            let (endpoint_ref, endpoint_number, signaling_number, trunk_ref) = match &leg.endpoint {
+                SessionEndpoint::Endpoint(endpoint) => (
+                    Some(endpoint.endpoint_id.to_string()),
+                    Some(endpoint.number.to_string()),
+                    Some(endpoint.number.to_string()),
+                    None,
+                ),
+                SessionEndpoint::Trunk { trunk_id } => (
+                    Some(trunk_id.to_string()),
+                    None,
+                    Some(call.callee_number.clone()),
+                    Some(trunk_id.to_string()),
+                ),
+                SessionEndpoint::AiAgent { agent_id } => (
+                    Some(format!("ai_agent:{agent_id}")),
+                    None,
+                    Some(call.callee_number.clone()),
+                    None,
+                ),
+                SessionEndpoint::External { number } => (
+                    call.inbound_trunk_ref.clone(),
+                    Some(number.clone()),
+                    Some(number.clone()),
+                    call.inbound_trunk_ref.clone(),
+                ),
+            };
+            Some(LegCdrRecord {
+                call_id: call.call_id.clone(),
+                session_id: leg.session_id.to_string(),
+                domain_id: leg.domain_id.to_string(),
+                leg_role: if caller { "caller" } else { "callee" }.to_owned(),
+                direction: if caller { "inbound" } else { "outbound" }.to_owned(),
+                endpoint_ref,
+                endpoint_number,
+                signaling_number,
+                route_id: if caller {
+                    call.inbound_route_id.clone()
+                } else {
+                    call.outbound_route_id.clone()
+                },
+                route_name: if caller {
+                    call.inbound_route_name.clone()
+                } else {
+                    call.outbound_route_name.clone()
+                },
+                trunk_name: if caller {
+                    call.inbound_trunk_name.clone()
+                } else if trunk_ref == call.outbound_trunk_ref {
+                    call.outbound_trunk_name.clone()
+                } else {
+                    None
+                },
+                trunk_ref,
+                joined_at_ms: leg.joined_at_ms,
+                answered_at_ms: bridges
+                    .iter()
+                    .map(|bridge| bridge.created_at_ms)
+                    .min()
+                    .or(if caller { call.answered_at_ms } else { None }),
+                left_at_ms: leg.left_at_ms.unwrap_or(ended_at_ms),
+                final_status: if caller || current {
+                    call.last_status
+                } else {
+                    Some(200)
+                },
+                hangup_cause: Some(if caller || current {
+                    hangup.clone()
+                } else {
+                    "normal_clearing".to_owned()
+                }),
+                media_packets: if caller || current { total_packets } else { 0 },
+                media_bytes: if caller || current { total_bytes } else { 0 },
+                media_rtcp_packets: if caller || current { total_rtcp } else { 0 },
+                bridge_ids: bridges
+                    .iter()
+                    .map(|bridge| bridge.bridge_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            })
+        })
+        .collect()
 }
 
 async fn finalize_call(state: AppState, call: FinalCallSnapshot, media: Option<MediaBridge>) {
@@ -331,4 +373,100 @@ async fn finalize_call(state: AppState, call: FinalCallSnapshot, media: Option<M
         answered = call.answered,
         "basic call completed"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::call::model::OutboundTarget;
+    use crate::runtime::call::regression::test_call;
+
+    fn endpoint(number: &str) -> OutboundTarget {
+        OutboundTarget::Endpoint {
+            endpoint_id: number.into(),
+            endpoint_number: number.into(),
+        }
+    }
+
+    #[test]
+    fn unconnected_attempts_do_not_fabricate_callee_cdrs() {
+        let call = test_call(endpoint("1002"));
+        let legs = build_leg_cdrs(
+            &FinalCallSnapshot::from(&call),
+            &MediaStatsSnapshot::default(),
+            300,
+        );
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].session_id, "caller-a");
+        assert!(legs[0].bridge_ids.is_empty());
+        assert_eq!(legs[0].answered_at_ms, None);
+    }
+
+    #[test]
+    fn sequential_hunt_uses_winner_join_time_and_real_bridge_id() {
+        let mut call = test_call(endpoint("1002"));
+        call.register_attempt(2, "callee-b".into(), &endpoint("1003"), 150)
+            .unwrap();
+        call.mark_answered(200, 1).unwrap();
+        call.activate_current_bridge(1, 210).unwrap();
+        call.release_topology(300);
+        let legs = build_leg_cdrs(
+            &FinalCallSnapshot::from(&call),
+            &MediaStatsSnapshot::default(),
+            310,
+        );
+        assert_eq!(legs.len(), 2);
+        let winner = legs
+            .iter()
+            .find(|leg| leg.session_id == "callee-b")
+            .unwrap();
+        assert_eq!(winner.joined_at_ms, 150);
+        assert_eq!(winner.answered_at_ms, Some(200));
+        assert_eq!(winner.left_at_ms, 300);
+        assert_eq!(winner.bridge_ids, "bridge-attempt-2");
+        assert_eq!(winner.endpoint_number.as_deref(), Some("1003"));
+        assert_eq!(winner.signaling_number.as_deref(), Some("1003"));
+    }
+
+    #[test]
+    fn ai_transfer_keeps_both_bridged_legs_and_ends_original_ai_leg() {
+        let mut call = test_call(OutboundTarget::AiAgent {
+            agent_id: "frontdesk".into(),
+        });
+        call.mark_answered(120, 1).unwrap();
+        call.activate_current_bridge(1, 125).unwrap();
+        call.register_attempt(2, "callee-human".into(), &endpoint("1003"), 200)
+            .unwrap();
+        call.mark_transfer_answered(250, 2).unwrap();
+        call.activate_current_bridge(2, 255).unwrap();
+        call.release_topology(400);
+        let stats = MediaStatsSnapshot {
+            caller_to_callee_packets: 10,
+            ..Default::default()
+        };
+        let legs = build_leg_cdrs(&FinalCallSnapshot::from(&call), &stats, 420);
+        assert_eq!(legs.len(), 3);
+        let ai = legs
+            .iter()
+            .find(|leg| leg.session_id == "callee-a")
+            .unwrap();
+        assert_eq!(ai.answered_at_ms, Some(120));
+        assert_eq!(ai.left_at_ms, 250);
+        assert_eq!(ai.bridge_ids, "bridge-attempt-1");
+        assert_eq!(ai.media_packets, 0);
+        let human = legs
+            .iter()
+            .find(|leg| leg.session_id == "callee-human")
+            .unwrap();
+        assert_eq!(human.joined_at_ms, 200);
+        assert_eq!(human.answered_at_ms, Some(250));
+        assert_eq!(human.left_at_ms, 400);
+        assert_eq!(human.bridge_ids, "bridge-attempt-2");
+        assert_eq!(human.media_packets, 10);
+        let caller = legs
+            .iter()
+            .find(|leg| leg.session_id == "caller-a")
+            .unwrap();
+        assert_eq!(caller.bridge_ids, "bridge-attempt-1,bridge-attempt-2");
+    }
 }

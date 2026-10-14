@@ -99,27 +99,53 @@ async fn main() -> Result<()> {
         "voipswitchd starting"
     );
 
-    let control = tokio::spawn(run_control_socket(command_service, control_socket));
-    let runtime = tokio::spawn(run_adapter_runtime_socket(
+    let mut control = tokio::spawn(run_control_socket(command_service, control_socket));
+    let mut runtime = tokio::spawn(run_adapter_runtime_socket(
         state.clone(),
         pbx_services.analysis.clone(),
         media_plane,
         runtime_socket,
     ));
 
-    tokio::select! {
-        _ = signal::ctrl_c() => {
+    let result: Result<()> = tokio::select! {
+        _ = shutdown_signal() => {
             info!("shutdown signal received");
+            Ok(())
         }
-        result = control => {
-            result.context("control socket task join")??;
-        }
-        result = runtime => {
-            result.context("runtime socket task join")??;
-        }
+        result = &mut control => result.context("control socket task join").and_then(|result| result),
+        result = &mut runtime => result.context("runtime socket task join").and_then(|result| result),
+    };
+    state.request_shutdown();
+    control.abort();
+    if !runtime.is_finished()
+        && tokio::time::timeout(std::time::Duration::from_secs(15), &mut runtime)
+            .await
+            .is_err()
+    {
+        tracing::error!("runtime shutdown deadline exceeded");
+        runtime.abort();
     }
+    state.drain_finalizers().await;
+    if let Some(writer) = state.cdr_writer() {
+        writer.shutdown().await;
+    }
+    info!("voipswitchd shutdown drain completed");
+    result?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
 }
 
 fn default_socket_path(file_name: &str) -> PathBuf {

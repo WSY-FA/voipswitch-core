@@ -275,6 +275,11 @@ impl SessionActor {
     }
 
     pub(crate) async fn run(mut self) {
+        if self.state.is_shutting_down() {
+            self.actor_started = true;
+            let result = self.begin_shutdown();
+            self.complete_processing(result);
+        }
         if !self.actor_started {
             self.actor_started = true;
             let initial_actions = std::mem::take(&mut self.initial_actions);
@@ -319,9 +324,16 @@ impl SessionActor {
                 );
             }
         }
+        let mut shutdown = self.state.subscribe_shutdown();
+        let mut shutdown_seen = false;
         loop {
             tokio::select! {
                 biased;
+                _ = shutdown.changed(), if !shutdown_seen => {
+                    shutdown_seen = true;
+                    let result = self.begin_shutdown();
+                    if !self.complete_processing(result) { break; }
+                }
                 message = self.control_rx.recv() => {
                     let Some(message) = message else { break; };
                     if !self.handle_control(message, ControlSource::OwnedLeg).await {
@@ -405,6 +417,9 @@ impl SessionActor {
 
     async fn handle_control(&mut self, message: ControlMessage, source: ControlSource) -> bool {
         if self.finalization_started {
+            if matches!(message, ControlMessage::ForceCleanup) {
+                return false;
+            }
             if matches!(message, ControlMessage::CallFinalized) {
                 self.finalized = true;
                 return false;
@@ -463,26 +478,55 @@ impl SessionActor {
                 self.finalized = true;
                 return false;
             }
-            ControlMessage::Shutdown => {
-                info!(
-                    call_id = %self.call.call_id(),
-                    session_id = self.owned_session_id,
-                    "coordinator owner session actor shutdown"
-                );
-                self.call.begin_terminating(HangupCause::InternalError);
-                if self.owned_session_id == self.call.caller_session_id() {
-                    self.call.caller_terminated = true;
-                } else if self.owned_session_id == self.call.callee_session_id() {
-                    self.call.callee_terminated = true;
-                }
-                self.call
-                    .hangup_cause
-                    .get_or_insert(HangupCause::SystemShutdown);
+            ControlMessage::ForceCleanup => {
+                let cause = if self.state.is_shutting_down() {
+                    HangupCause::SystemShutdown
+                } else {
+                    HangupCause::InternalError
+                };
+                self.call.begin_terminating(cause);
                 self.begin_finish_call();
-                return true;
+                return false;
             }
+            ControlMessage::Shutdown => self.begin_shutdown(),
         };
         self.complete_processing(result)
+    }
+
+    pub(super) fn begin_shutdown(&mut self) -> Result<()> {
+        self.retry_after_cleanup = None;
+        if self.call.is_terminating() {
+            return Ok(());
+        }
+        let answered = self.call.is_answered();
+        self.call.begin_terminating(HangupCause::SystemShutdown);
+        self.cancel_timer(CallTimerKind::Dial);
+        self.cancel_timer(CallTimerKind::Ring);
+        let call_id = self.call.call_id().to_string();
+        if !self.call.caller_terminated {
+            self.submit_caller_action(
+                if answered { "HangupDialog" } else { "RejectInboundInvite" },
+                format!("shutdown-caller-{call_id}"),
+                json!({"adapter_call_leg_id": self.call.caller_adapter_leg_id.as_str(), "status_code": 503}),
+            )?;
+        }
+        if self.ai_agent_conversation_active() && self.pending_ai_transfer.is_none() {
+            self.call.callee_terminated = true;
+        }
+        if !self.call.callee_terminated {
+            self.submit_callee_action(
+                if answered && self.pending_ai_transfer.is_none() {
+                    "HangupDialog"
+                } else {
+                    "CancelOutbound"
+                },
+                format!("shutdown-callee-{call_id}"),
+                json!({"reason": "system_shutdown"}),
+            )?;
+        }
+        self.start_timer(CallTimerKind::Cleanup);
+        self.publish_call_view();
+        Ok(())
     }
 
     fn complete_processing(&mut self, result: Result<()>) -> bool {
@@ -1552,7 +1596,7 @@ impl CalleeSessionActor {
             }
             ControlMessage::MediaDtmfObserved(event) => self.handle_source_digit(event).await,
             ControlMessage::SipDtmfReceived(event) => self.handle_source_digit(event).await,
-            ControlMessage::Shutdown => false,
+            ControlMessage::Shutdown | ControlMessage::ForceCleanup => false,
             ControlMessage::PrepareCoordinatorHandoff { .. }
             | ControlMessage::PrepareCoordinatorTarget { .. } => {
                 warn!(

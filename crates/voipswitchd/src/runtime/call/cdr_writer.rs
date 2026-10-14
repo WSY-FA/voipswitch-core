@@ -3,10 +3,10 @@ use crate::app::AppState;
 use crate::config_service::CdrSpoolLimits;
 use crate::data_store::CdrWriteCommand;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{error, info, warn};
 
 const CDR_WRITER_QUEUE_CAPACITY: usize = 512;
@@ -20,21 +20,29 @@ pub(crate) enum CdrWriterMessage {
     Write {
         command: Box<CdrWriteCommand>,
         durable_tx: oneshot::Sender<Result<(), String>>,
+        permit: OwnedSemaphorePermit,
     },
-    #[allow(dead_code)]
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
 pub(crate) struct CdrWriter {
     tx: mpsc::Sender<CdrWriterMessage>,
     admission: Arc<SpoolAdmission>,
+    permits: Arc<Mutex<DomainPermits>>,
+}
+
+#[derive(Default)]
+struct DomainPermits {
+    closed: bool,
+    domains: HashMap<String, Arc<Semaphore>>,
 }
 
 #[derive(Clone)]
 struct DomainWorkerHandle {
     wake_tx: mpsc::Sender<()>,
     spool_lock: Arc<Mutex<()>>,
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 struct SpoolAdmission {
@@ -47,6 +55,7 @@ struct DomainSpoolStatus {
     backlog_bytes: u64,
     rejecting_new_calls: bool,
     warning_active: bool,
+    append_failed: bool,
 }
 
 impl SpoolAdmission {
@@ -100,7 +109,16 @@ impl SpoolAdmission {
             .lock()
             .expect("CDR spool admission lock")
             .get(domain_id)
-            .is_none_or(|status| !status.rejecting_new_calls)
+            .is_none_or(|status| !status.rejecting_new_calls && !status.append_failed)
+    }
+
+    fn append_failure(&self, domain_id: &str, failed: bool) {
+        self.domains
+            .lock()
+            .expect("CDR spool admission lock")
+            .entry(domain_id.to_owned())
+            .or_default()
+            .append_failed = failed;
     }
 
     fn set_limits(&self, limits: CdrSpoolLimits) {
@@ -125,15 +143,32 @@ impl CdrWriter {
             state.config().snapshot().cdr_spool_limits(),
         ));
         tokio::spawn(run_writer(rx, state, admission.clone()));
-        Self { tx, admission }
+        Self {
+            tx,
+            admission,
+            permits: Arc::new(Mutex::new(DomainPermits::default())),
+        }
     }
 
     pub(crate) async fn enqueue_durable(&self, command: CdrWriteCommand) -> Result<()> {
+        let permits = {
+            let mut pool = self.permits.lock().expect("CDR domain permits lock");
+            anyhow::ensure!(!pool.closed, "CDR writer stopped");
+            pool.domains
+                .entry(command.call_cdr.domain_id.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(CDR_WRITER_QUEUE_CAPACITY)))
+                .clone()
+        };
+        let permit = permits
+            .acquire_owned()
+            .await
+            .context("CDR writer stopped")?;
         let (durable_tx, durable_rx) = oneshot::channel();
         self.tx
             .send(CdrWriterMessage::Write {
                 command: Box::new(command),
                 durable_tx,
+                permit,
             })
             .await
             .context("CDR writer queue closed")?;
@@ -151,10 +186,43 @@ impl CdrWriter {
         self.admission.set_limits(limits);
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn shutdown(&self) {
-        let _ = self.tx.send(CdrWriterMessage::Shutdown).await;
+        {
+            let mut pool = self.permits.lock().expect("CDR domain permits lock");
+            pool.closed = true;
+            for permits in pool.domains.values() {
+                permits.close();
+            }
+        }
+        let (reply, done) = oneshot::channel();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            self.tx
+                .send(CdrWriterMessage::Shutdown(reply))
+                .await
+                .context("CDR shutdown channel closed")?;
+            done.await.context("CDR shutdown acknowledgement dropped")
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            error!(
+                pending = self
+                    .permits
+                    .lock()
+                    .expect("CDR domain permits lock")
+                    .domains
+                    .values()
+                    .map(|permits| CDR_WRITER_QUEUE_CAPACITY - permits.available_permits())
+                    .sum::<usize>(),
+                "CDR shutdown deadline: batches remain without durable ACK"
+            );
+        }
     }
+}
+
+struct PendingAppend {
+    command: Box<CdrWriteCommand>,
+    durable_tx: oneshot::Sender<Result<(), String>>,
+    _permit: OwnedSemaphorePermit,
 }
 
 async fn run_writer(
@@ -163,33 +231,95 @@ async fn run_writer(
     admission: Arc<SpoolAdmission>,
 ) {
     let mut workers: HashMap<String, DomainWorkerHandle> = HashMap::new();
+    let mut pending: HashMap<String, VecDeque<PendingAppend>> = HashMap::new();
     start_replay_workers(&state, &admission, &mut workers).await;
-    info!("CDR writer started");
-
-    while let Some(message) = rx.recv().await {
-        match message {
-            CdrWriterMessage::Write {
-                command,
-                durable_tx,
-            } => {
-                let result = append_and_wake(&state, &admission, &mut workers, *command).await;
-                let _ = durable_tx.send(result.map_err(|err| err.to_string()));
-            }
-            CdrWriterMessage::Shutdown => {
-                info!("CDR writer shutting down, durably spooling queued messages");
-                while let Ok(CdrWriterMessage::Write {
-                    command,
-                    durable_tx,
-                }) = rx.try_recv()
-                {
-                    let result = append_and_wake(&state, &admission, &mut workers, *command).await;
-                    let _ = durable_tx.send(result.map_err(|err| err.to_string()));
+    let mut retry = tokio::time::interval(Duration::from_millis(BASE_RETRY_DELAY_MS));
+    let mut shutdown_reply = None;
+    loop {
+        tokio::select! {
+            message = rx.recv(), if !rx.is_closed() || !rx.is_empty() => {
+                match message {
+                    Some(CdrWriterMessage::Write { command, durable_tx, permit }) => {
+                        let domain_id = command.call_cdr.domain_id.clone();
+                        pending.entry(domain_id.clone()).or_default().push_back(PendingAppend {
+                            command, durable_tx, _permit: permit,
+                        });
+                        flush_pending_domain(&state, &admission, &mut workers, &mut pending, &domain_id).await;
+                    }
+                    Some(CdrWriterMessage::Shutdown(reply)) => {
+                        rx.close();
+                        shutdown_reply = Some(reply);
+                    }
+                    None => {}
                 }
+            }
+            _ = retry.tick() => {
+                let domains: Vec<_> = pending.keys().cloned().collect();
+                for domain in domains {
+                    flush_pending_domain(&state, &admission, &mut workers, &mut pending, &domain).await;
+                }
+            }
+        }
+        if rx.is_closed() && rx.is_empty() && pending.is_empty() {
+            let mut tasks = Vec::new();
+            for worker in workers.into_values() {
+                let _ = worker.wake_tx.try_send(());
+                if let Some(task) = worker.task.lock().expect("CDR worker task lock").take() {
+                    tasks.push(task);
+                }
+                // Close the wake channel after scheduling a final replay.
+                drop(worker);
+            }
+            let drain = tokio::time::timeout(Duration::from_secs(5), async {
+                for task in &mut tasks {
+                    let _ = task.await;
+                }
+            })
+            .await;
+            if drain.is_err() {
+                error!(
+                    "CDR replay workers did not drain before shutdown deadline; durable backlog retained"
+                );
+                for task in tasks {
+                    task.abort();
+                }
+            }
+            if let Some(reply) = shutdown_reply.take() {
+                let _ = reply.send(());
+            }
+            break;
+        }
+    }
+    info!("CDR writer stopped after durable drain");
+}
+
+async fn flush_pending_domain(
+    state: &AppState,
+    admission: &Arc<SpoolAdmission>,
+    workers: &mut HashMap<String, DomainWorkerHandle>,
+    pending: &mut HashMap<String, VecDeque<PendingAppend>>,
+    domain_id: &str,
+) {
+    let Some(queue) = pending.get_mut(domain_id) else {
+        return;
+    };
+    while let Some(item) = queue.front() {
+        match append_and_wake(state, admission, workers, &item.command).await {
+            Ok(()) => {
+                admission.append_failure(domain_id, false);
+                if let Some(item) = queue.pop_front() {
+                    let _ = item.durable_tx.send(Ok(()));
+                }
+            }
+            Err(_) => {
+                admission.append_failure(domain_id, true);
                 break;
             }
         }
     }
-    info!("CDR writer stopped");
+    if queue.is_empty() {
+        pending.remove(domain_id);
+    }
 }
 
 async fn start_replay_workers(
@@ -216,8 +346,9 @@ async fn append_and_wake(
     state: &AppState,
     admission: &Arc<SpoolAdmission>,
     workers: &mut HashMap<String, DomainWorkerHandle>,
-    command: CdrWriteCommand,
+    command: &CdrWriteCommand,
 ) -> Result<()> {
+    let command = command.clone();
     let call_id = command.call_cdr.call_id.clone();
     let domain_id = command.call_cdr.domain_id.clone();
     let worker = ensure_domain_worker(state, admission, workers, &domain_id);
@@ -287,7 +418,7 @@ fn ensure_domain_worker(
         .or_insert_with(|| {
             let (tx, rx) = mpsc::channel(1);
             let spool_lock = Arc::new(Mutex::new(()));
-            tokio::spawn(run_domain_worker(
+            let task = tokio::spawn(run_domain_worker(
                 domain_id.to_string(),
                 state.clone(),
                 admission.clone(),
@@ -297,6 +428,7 @@ fn ensure_domain_worker(
             DomainWorkerHandle {
                 wake_tx: tx,
                 spool_lock,
+                task: Arc::new(Mutex::new(Some(task))),
             }
         })
         .clone()
@@ -465,6 +597,75 @@ fn retry_delay_ms(attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_first_append_is_retained_and_recovered_without_blocking_other_domain() -> Result<()> {
+        use super::super::cdr_spool::tests::command;
+        use crate::data_store::PageRequest;
+        use crate::runtime::call::regression::test_state;
+        let temp = tempfile::tempdir()?;
+        let state = test_state(temp.path());
+        let backend = state.backend();
+        let broken_root = backend.cdr_spool_dir("domain-a")?;
+        std::fs::create_dir_all(broken_root.parent().unwrap())?;
+        std::fs::write(&broken_root, b"not a directory")?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let writer = CdrWriter::spawn(state.clone());
+            let failed_writer = writer.clone();
+            let mut failed =
+                tokio::spawn(
+                    async move { failed_writer.enqueue_durable(command("call-failed")).await },
+                );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while writer.admits_new_call("domain-a") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), &mut failed)
+                    .await
+                    .is_err()
+            );
+            assert!(!writer.admits_new_call("domain-a"));
+            assert!(writer.admits_new_call("domain-b"));
+            let mut healthy = command("call-healthy");
+            healthy.call_cdr.domain_id = "domain-b".into();
+            healthy.trace_domain_id = "domain-b".into();
+            tokio::time::timeout(Duration::from_secs(3), writer.enqueue_durable(healthy)).await??;
+            assert!(!failed.is_finished());
+            std::fs::remove_file(&broken_root)?;
+            tokio::time::timeout(Duration::from_secs(3), &mut failed).await???;
+            assert!(writer.admits_new_call("domain-a"));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let backend = backend.clone();
+                    let counts = tokio::task::spawn_blocking(move || -> Result<_> {
+                        let page = PageRequest {
+                            page: 1,
+                            page_size: 10,
+                        };
+                        Ok((
+                            backend.list_cdr(Some("domain-a"), page)?.rows.len(),
+                            backend.list_cdr(Some("domain-b"), page)?.rows.len(),
+                        ))
+                    })
+                    .await??;
+                    if counts == (1, 1) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            writer.shutdown().await;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        drop(runtime);
+        Ok(())
+    }
 
     #[test]
     fn spool_admission_uses_configured_hysteresis() {

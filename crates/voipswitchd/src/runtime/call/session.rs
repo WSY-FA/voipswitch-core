@@ -44,6 +44,7 @@ pub(crate) enum ControlMessage {
         reply: oneshot::Sender<Result<CalleeSessionActor, String>>,
     },
     CallFinalized,
+    ForceCleanup,
     Shutdown,
 }
 
@@ -600,6 +601,16 @@ impl SessionManager {
         self.leg_sessions
             .get(adapter_call_leg_id)
             .map(String::as_str)
+    }
+
+    pub(crate) fn coordinators(&self) -> impl Iterator<Item = (&str, &CallCoordinatorHandle)> {
+        self.call_coordinators
+            .values()
+            .map(|entry| (entry.session_id.as_str(), &entry.handle))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.call_coordinators.is_empty()
     }
 
     pub(crate) fn handles(&self) -> impl Iterator<Item = (&str, &SessionHandle)> {

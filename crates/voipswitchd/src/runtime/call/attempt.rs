@@ -64,6 +64,9 @@ impl AttemptRegistrar {
 
 impl SessionActor {
     pub(super) fn begin_ai_transfer_attempt(&mut self, candidate: OutboundCandidate) -> Result<()> {
+        if self.state.is_shutting_down() || self.call.is_terminating() {
+            return Err(anyhow!("call is draining"));
+        }
         if self.pending_attempt_candidate.is_some()
             || self.pending_attempt_registration.is_some()
             || self.runtime.pending_ai_transfer.is_none()
@@ -207,6 +210,9 @@ impl SessionActor {
     }
 
     fn begin_next_attempt(&mut self, previous_status: u16) -> Result<bool> {
+        if self.state.is_shutting_down() || self.call.is_terminating() {
+            return Ok(false);
+        }
         if !retryable_status(previous_status)
             || self.route_budget_remaining() < self.call.config_snapshot.timeouts.min_attempt_window
         {

@@ -87,8 +87,13 @@ impl CdrSpool {
             .append(true)
             .open(&path)
             .with_context(|| format!("open CDR spool segment {}", path.display()))?;
-        file.write_all(&frame)?;
-        file.sync_data()?;
+        // An unsuccessful append must not leave a partial frame before the retry.
+        if let Err(error) = file.write_all(&frame).and_then(|()| file.sync_data()) {
+            file.set_len(offset)?;
+            file.sync_all()?;
+            return Err(error).context("durable CDR append failed");
+        }
+        sync_directory(&self.root)?;
         Ok(SpoolPosition {
             segment,
             offset: offset.saturating_add(frame.len() as u64),
@@ -337,11 +342,11 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::data_store::CdrRecord;
 
-    fn command(call_id: &str) -> CdrWriteCommand {
+    pub(crate) fn command(call_id: &str) -> CdrWriteCommand {
         CdrWriteCommand {
             call_cdr: CdrRecord {
                 call_id: call_id.to_string(),

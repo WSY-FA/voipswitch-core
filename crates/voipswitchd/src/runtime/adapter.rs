@@ -42,7 +42,7 @@ use voipswitch_core::types::ids::{
 use voipswitch_core::types::time::unix_timestamp_ms;
 
 pub(crate) use writer::AdapterRuntimeWriter;
-use writer::spawn_adapter_runtime_writer;
+pub(crate) use writer::spawn_adapter_runtime_writer;
 
 const CALL_ADMISSION_CAPACITY: usize = 256;
 const RUNTIME_INBOUND_QUEUE_CAPACITY: usize = 50_000;
@@ -81,26 +81,52 @@ pub async fn run_adapter_runtime_socket(
         .with_context(|| format!("bind adapter runtime socket {}", path.display()))?;
     info!(socket = %path.display(), "adapter runtime socket listening");
 
+    let mut shutdown = state.subscribe_shutdown();
+    let mut clients = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await.context("accept adapter client")?;
-        let state = state.clone();
-        let analysis = analysis.clone();
-        let media_plane = media_plane.clone();
-        tokio::spawn(async move {
-            state.increment_adapter_clients();
-            let result = handle_adapter_client(stream, state.clone(), analysis, media_plane).await;
-            state.decrement_adapter_clients();
-            if state.adapter_clients() == 0 {
-                state.mark_registration_mirror_ready(false);
-                state.mark_trunk_runtime_mirror_ready(false);
-                state.clear_active_calls();
-                state.clear_adapter_runtime();
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("accept adapter client")?;
+                let state = state.clone();
+                let analysis = analysis.clone();
+                let media_plane = media_plane.clone();
+                clients.spawn(async move {
+                    state.increment_adapter_clients();
+                    let result = handle_adapter_client(stream, state.clone(), analysis, media_plane).await;
+                    state.decrement_adapter_clients();
+                    if state.adapter_clients() == 0 {
+                        state.mark_registration_mirror_ready(false);
+                        state.mark_trunk_runtime_mirror_ready(false);
+                        state.clear_active_calls();
+                        state.clear_adapter_runtime();
+                    }
+                    if let Err(err) = result {
+                        debug!(error = %err, "adapter client disconnected");
+                    }
+                });
             }
-            if let Err(err) = result {
-                debug!(error = %err, "adapter client disconnected");
-            }
-        });
+            _ = clients.join_next(), if !clients.is_empty() => {}
+        }
     }
+    drop(listener);
+    if tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while clients.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        warn!(
+            remaining_clients = clients.len(),
+            "runtime client drain deadline exceeded"
+        );
+        clients.abort_all();
+        while clients.join_next().await.is_some() {}
+    }
+    Ok(())
 }
 
 async fn handle_adapter_client(
@@ -110,9 +136,13 @@ async fn handle_adapter_client(
     media_plane: MediaPlaneManager,
 ) -> Result<()> {
     let mut config_updates = state.config().subscribe();
-    let hello: RuntimeEnvelope = read_json_frame(&mut stream)
-        .await
-        .context("read adapter hello")?;
+    let hello: RuntimeEnvelope = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_json_frame(&mut stream),
+    )
+    .await
+    .context("adapter hello deadline")?
+    .context("read adapter hello")?;
     if hello.r#type != "AdapterHello" {
         let response = RuntimeEnvelope::new(
             "core",
@@ -171,16 +201,45 @@ async fn handle_adapter_client(
         tokio::sync::mpsc::channel::<CallCreationResult>(CALL_ADMISSION_CAPACITY);
     let admission_permits = Arc::new(Semaphore::new(CALL_ADMISSION_CAPACITY));
     let mut inflight_invites = HashSet::new();
+    let mut shutdown = state.subscribe_shutdown();
+    let mut draining_since = None;
+    let mut forced_cleanup = false;
+    let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(20));
 
     let loop_result = async {
         loop {
+            if draining_since.is_some() && session_manager.is_empty() && inflight_invites.is_empty() {
+                return Ok(());
+            }
             tokio::select! {
+                _ = shutdown.changed(), if draining_since.is_none() => {
+                    draining_since = Some(tokio::time::Instant::now());
+                    shutdown_coordinators(&session_manager, &control_dispatcher, false).await;
+                }
+                _ = drain_tick.tick() => {
+                    if draining_since.is_none() && state.is_shutting_down() {
+                        draining_since = Some(tokio::time::Instant::now());
+                        shutdown_coordinators(&session_manager, &control_dispatcher, false).await;
+                    }
+                    if let Some(start) = draining_since {
+                        if !forced_cleanup && start.elapsed() >= std::time::Duration::from_secs(5) {
+                            warn!(sessions = session_manager.handles().count(), "forcing remaining call cleanup after shutdown deadline");
+                            shutdown_coordinators(&session_manager, &control_dispatcher, true).await;
+                            forced_cleanup = true;
+                        }
+                        if start.elapsed() >= std::time::Duration::from_secs(7) { return Ok(()); }
+                    }
+                }
                 frame = inbound_rx.recv() => {
                     let frame = frame.context("adapter runtime reader stopped")?;
                     if is_call_leg_event(&frame.r#type) {
                         if frame.r#type == "InboundInviteOffered" {
                             let event: InboundInviteOffered = serde_json::from_value(frame.body.clone())
                                 .context("decode InboundInviteOffered")?;
+                            if draining_since.is_some() || state.is_shutting_down() {
+                                reject_inbound_invite(&runtime_writer, &event, 503).await?;
+                                continue;
+                            }
                             let adapter_call_leg_id = event.adapter_call_leg_id.clone();
                             if !inflight_invites.insert(adapter_call_leg_id.clone()) {
                                 debug!(adapter_call_leg_id, "duplicate in-flight inbound invite ignored");
@@ -452,6 +511,11 @@ async fn handle_adapter_client(
                                 &created.call_id,
                                 created.callee_handle.clone(),
                             );
+                            if draining_since.is_some() {
+                                let message = if forced_cleanup { ControlMessage::ForceCleanup } else { ControlMessage::Shutdown };
+                                let _ = control_dispatcher.dispatch_to(&created.caller_session_id,
+                                    created.coordinator_handle.control_sender(), message).await;
+                            }
                             tokio::spawn(created.callee_actor.run());
                             tokio::spawn(created.caller_actor.run());
                         }
@@ -489,6 +553,10 @@ async fn handle_adapter_client(
                     let Some(request) = request else {
                         anyhow::bail!("coordinator handoff request channel closed");
                     };
+                    if draining_since.is_some() || state.is_shutting_down() {
+                        let _ = request.reply.send(Err("runtime_draining".to_owned()));
+                        continue;
+                    }
                     begin_coordinator_handoff(
                         request,
                         &mut session_manager,
@@ -518,13 +586,42 @@ async fn handle_adapter_client(
     }
     .await;
 
+    // On transport failure no terminal SIP callbacks can arrive. Force the same
+    // resource/CDR finalizer, including admissions already being constructed.
+    shutdown_coordinators(&session_manager, &control_dispatcher, true).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !session_manager.is_empty() || !inflight_invites.is_empty() {
+            tokio::select! {
+                call_id = finished_rx.recv() => {
+                    if let Some(call_id) = call_id { session_manager.destroy_call(&call_id); }
+                }
+                created = creation_rx.recv(), if !inflight_invites.is_empty() => {
+                    if let Some(created) = created {
+                        inflight_invites.remove(&created.adapter_call_leg_id);
+                        if let Ok(Some(mut created)) = created.result {
+                            created.caller_actor.runtime.actor_started = true;
+                            let _ = control_dispatcher.dispatch_to(&created.caller_session_id,
+                                created.coordinator_handle.control_sender(), ControlMessage::ForceCleanup).await;
+                            session_manager.register_caller(&created.caller_session_id, &created.call_id,
+                                &created.caller_adapter_leg_id, created.caller_handle, created.coordinator_handle);
+                            tokio::spawn(created.callee_actor.run());
+                            tokio::spawn(created.caller_actor.run());
+                        }
+                    }
+                }
+            }
+        }
+    }).await;
     for (session_id, handle) in session_manager.handles() {
         let _ = control_dispatcher
             .dispatch(session_id, handle, ControlMessage::Shutdown)
             .await;
     }
-    drop(control_dispatcher);
+    // Actors/finalizers hold dispatcher clones: waiting for sender drop here
+    // creates a cycle during failed durable writes. Teardown is explicitly bounded.
+    control_dispatcher_task.abort();
     let _ = control_dispatcher_task.await;
+    drop(control_dispatcher);
     drop(runtime_writer);
     if !writer_task.is_finished() {
         writer_task.abort();
@@ -537,6 +634,23 @@ async fn handle_adapter_client(
     dtmf_operations.detach_runtime(dtmf_runtime_generation);
     coordinator_handoffs.detach_runtime(handoff_runtime_generation);
     loop_result
+}
+
+async fn shutdown_coordinators(
+    manager: &SessionManager,
+    dispatcher: &CriticalControlDispatcher,
+    force: bool,
+) {
+    for (session_id, handle) in manager.coordinators() {
+        let message = if force {
+            ControlMessage::ForceCleanup
+        } else {
+            ControlMessage::Shutdown
+        };
+        let _ = dispatcher
+            .dispatch_to(session_id, handle.control_sender(), message)
+            .await;
+    }
 }
 
 async fn begin_coordinator_handoff(

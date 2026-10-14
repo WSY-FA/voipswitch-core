@@ -12,6 +12,8 @@ pub(crate) mod handoff;
 mod media_action;
 mod model;
 mod registry;
+#[cfg(test)]
+pub(super) mod regression;
 pub(crate) mod session;
 pub(crate) mod timer;
 
@@ -683,11 +685,22 @@ impl SessionActor {
     }
 
     async fn handle_provisional(&mut self, event: CallLegEvent) -> Result<()> {
+        if self.call.is_terminating()
+            || self.pending_answer.is_some()
+            || self.answer_in_progress
+            || (self.call.is_answered() && self.runtime.pending_ai_transfer.is_none())
+        {
+            return Ok(());
+        }
+        let status_code = event.status_code.unwrap_or(180);
+        if !matches!(status_code, 180 | 183) {
+            return Ok(());
+        }
         self.cancel_timer(CallTimerKind::Dial);
         if self.runtime.pending_ai_transfer.is_some() {
             let status_code = event.status_code.unwrap_or(180);
             self.call.last_status = Some(status_code);
-            if matches!(status_code, 180 | 183) && self.call.ring_timer_generation == 0 {
+            if matches!(status_code, 180 | 183) && self.ring_timer.is_none() {
                 self.start_timer(CallTimerKind::Ring);
             }
             self.publish_call_view();
@@ -703,8 +716,10 @@ impl SessionActor {
             return Ok(());
         }
         let status_code = event.status_code.unwrap_or(180);
-        let start_ring_timer =
-            matches!(status_code, 180 | 183) && self.call.ring_timer_generation == 0;
+        let start_ring_timer = matches!(status_code, 180 | 183) && self.ring_timer.is_none();
+        if start_ring_timer {
+            self.start_timer(CallTimerKind::Ring);
+        }
         if let Some(sdp) = event.sdp {
             if self.call.media.is_none() {
                 self.fail_media_negotiation(
@@ -730,9 +745,6 @@ impl SessionActor {
             "session_id": self.call.caller_session_id(), "adapter_call_leg_id": self.call.caller_adapter_leg_id.as_str(),
             "status_code": status_code, "sdp": Value::Null,
         }))?;
-        if start_ring_timer {
-            self.start_timer(CallTimerKind::Ring);
-        }
         self.publish_call_view();
         Ok(())
     }
@@ -1063,7 +1075,13 @@ impl SessionActor {
                 purpose,
                 result,
             } => {
-                if generation != self.media_generation || self.call.is_terminating() {
+                if generation != self.media_generation
+                    || self.call.is_terminating()
+                    || (matches!(purpose, PrepareSdpPurpose::Provisional { .. })
+                        && (self.pending_answer.is_some()
+                            || self.answer_in_progress
+                            || self.call.is_answered()))
+                {
                     tracing::debug!(
                         call_id = self.call.call_id(),
                         action_id,
@@ -1104,7 +1122,7 @@ impl SessionActor {
                                 "sdp": prepared,
                             }),
                         )?;
-                        if start_ring_timer {
+                        if start_ring_timer && self.ring_timer.is_none() {
                             self.start_timer(CallTimerKind::Ring);
                         }
                     }
@@ -1246,17 +1264,18 @@ impl SessionActor {
     async fn handle_failed(&mut self, event: CallLegEvent) -> Result<()> {
         self.cancel_timer(CallTimerKind::Dial);
         let status_code = event.status_code.unwrap_or(480);
-        if self.runtime.pending_ai_transfer.is_some() {
+        if !self.call.is_terminating() && self.runtime.pending_ai_transfer.is_some() {
             self.fail_ai_transfer(format!("sip_{status_code}"))?;
             return Ok(());
         }
-        if self.retry_after_attempt_ended(status_code)? {
+        if !self.call.is_terminating() && self.retry_after_attempt_ended(status_code)? {
             return Ok(());
         }
         let should_signal_peer = !self.call.is_terminating();
-        self.call.last_status = event.status_code;
-        self.call.state = CallState::Terminating;
-        self.call.hangup_cause = Some(HangupCause::CallRejected);
+        if should_signal_peer {
+            self.call.last_status = event.status_code;
+        }
+        self.call.begin_terminating(HangupCause::CallRejected);
         if event.session_id.as_deref() == Some(self.call.callee_session_id()) {
             self.call.callee_terminated = true;
         }
@@ -1348,7 +1367,9 @@ impl SessionActor {
         let should_signal_peer = !self.call.is_terminating();
         self.call.caller_terminated = true;
         self.call.state = CallState::Terminating;
-        self.call.hangup_cause = Some(HangupCause::OriginatorCancel);
+        self.call
+            .hangup_cause
+            .get_or_insert(HangupCause::OriginatorCancel);
         let mut start_cleanup_timer = false;
         if should_signal_peer {
             self.call.begin_terminating(HangupCause::InternalError);
@@ -1396,20 +1417,26 @@ impl SessionActor {
         if self.runtime.ai_transfer_failed && session_id != Some(self.call.caller_session_id()) {
             return Ok(());
         }
-        if self.runtime.pending_ai_transfer.is_some()
+        if !self.call.is_terminating()
+            && self.runtime.pending_ai_transfer.is_some()
             && session_id != Some(self.call.caller_session_id())
         {
             self.fail_ai_transfer("callee_disconnected".to_string())?;
             return Ok(());
         }
-        if session_id == Some(self.call.callee_session_id()) && self.retry_after_cleanup.is_some() {
+        if !self.call.is_terminating()
+            && session_id == Some(self.call.callee_session_id())
+            && self.retry_after_cleanup.is_some()
+        {
             self.retry_after_attempt_ended(event.status_code.unwrap_or(487))?;
             return Ok(());
         }
         self.cancel_timer(CallTimerKind::Dial);
         let should_signal_peer = !self.call.is_terminating();
         self.call.state = CallState::Terminating;
-        self.call.last_status = event.status_code.or(self.call.last_status);
+        if should_signal_peer {
+            self.call.last_status = event.status_code.or(self.call.last_status);
+        }
         self.call
             .hangup_cause
             .get_or_insert(HangupCause::NormalClearing);
