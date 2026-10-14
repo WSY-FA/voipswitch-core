@@ -747,6 +747,8 @@ impl ConfigBackend for SeaOrmConfigBackend {
 }
 
 impl SeaOrmConfigBackend {
+    // Staged AI-04 API; production task scheduling is not yet connected.
+    #[cfg(test)]
     pub fn create_ai_ops_task(&self, task: &super::AiOpsTaskRecord) -> Result<bool> {
         self.block_on(async {
             let conn = self.open_system_db().await?;
@@ -758,6 +760,8 @@ impl SeaOrmConfigBackend {
         })
     }
 
+    // Staged AI-04 API; production task scheduling is not yet connected.
+    #[cfg(test)]
     pub fn get_ai_ops_task_by_request(
         &self,
         request_id: &str,
@@ -779,6 +783,8 @@ impl SeaOrmConfigBackend {
         })
     }
 
+    // Staged AI-04 API; production task scheduling is not yet connected.
+    #[cfg(test)]
     pub fn get_ai_ops_task(&self, task_id: &str) -> Result<Option<super::AiOpsTaskRecord>> {
         self.block_on(async {
             let conn = self.open_system_db().await?;

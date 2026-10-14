@@ -76,6 +76,8 @@ impl OpsTask {
         }
     }
 
+    // AI-04 scheduler is not yet connected; keep its contract under test.
+    #[cfg(test)]
     pub fn cancel(&mut self) -> bool {
         self.transition(TaskState::Cancelled)
     }
