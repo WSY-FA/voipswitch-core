@@ -1857,7 +1857,9 @@ pub(crate) fn spawn_builtin_prompt(
                     return;
                 }
                 let payload: Vec<u8> = chunk
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|sample| pcm16_to_alaw(i16::from_le_bytes([sample[0], sample[1]])))
                     .collect();
                 if media

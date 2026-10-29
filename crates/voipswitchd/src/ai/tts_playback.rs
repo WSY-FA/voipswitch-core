@@ -55,7 +55,9 @@ impl TtsPlayback {
         let mut frames = Vec::new();
         for chunk in pcm16_le.chunks(input_samples_per_packet * 2) {
             let payload = chunk
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|bytes| {
                     let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
                     match codec {
