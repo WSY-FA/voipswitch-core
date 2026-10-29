@@ -24,4 +24,4 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 voipswitch-core = { path = "../voipswitch-core" }
-ai-protocol = { path = "../../../voipswitch-ai/crates/ai-protocol" }
+ai-protocol = { path = "../ai-protocol" }

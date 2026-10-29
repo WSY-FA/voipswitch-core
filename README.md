@@ -4,9 +4,9 @@
 
 [English](README.md) | [简体中文](README_zh-CN.md) · [MIT License](LICENSE)
 
-VoIPSwitch separates SIP protocol state from PBX business logic. This repository builds `voipswitchd` (core daemon) and `vs_cli` (local management client). Web management, SIP adaptation and AI processing run as separate processes on the same machine.
+VoIPSwitch separates SIP protocol state from PBX business logic. This repository builds `voipswitchd` (core daemon), `vs_cli` (local management client) and `vs_mock_adapterd` (loopback adapter for local demos and CI). Web management, SIP adaptation and AI processing run as separate processes on the same machine.
 
-> Development-stage software. The SIP adapter uses a private SIP stack and is not included in this repository. Building Core alone does not provide a working SIP telephone service.
+> Development-stage software. The production SIP adapter uses a private SIP stack and is not included in this repository. `vs_mock_adapterd` exercises the runtime protocol without SIP or RTP; it is a test tool, not a production adapter.
 
 ## What it does
 
@@ -37,9 +37,8 @@ More: [call flow](docs/assets/call-flow.png) · [config reload](docs/assets/conf
 
 - Linux and a current stable Rust toolchain supporting edition 2024.
 - Clang with the BPF target: Core's build script currently compiles an eBPF object even when forwarding will use userspace.
-- The `voipswitch-ai` repository checked out next to `voipswitch-core`: `voipswitchd` currently has a local path dependency on `../voipswitch-ai/crates/ai-protocol`.
 
-Do not assume this repository is a standalone checkout until that sibling dependency is available. No minimum supported Rust version or hardware capacity is claimed yet.
+This repository builds on its own; the AI protocol types are part of the workspace. No minimum supported Rust version or hardware capacity is claimed yet.
 
 From this repository:
 
@@ -58,6 +57,16 @@ cargo run -p vs_cli
 ```
 
 Data defaults to `data/`. Sockets default to `$XDG_RUNTIME_DIR/voipswitch/`, or `/tmp/voipswitch/` when `XDG_RUNTIME_DIR` is unset. Use each binary's `--help` for overrides.
+
+### Try a call without a SIP adapter
+
+`scripts/mock_call_demo.sh` starts the daemon in a temporary directory, creates a demo domain with extensions 1001 and 1002, runs `vs_mock_adapterd` to register both endpoints and place one call, then prints the CDR. No SIP or RTP is involved, so media counters stay at zero.
+
+```bash
+bash scripts/mock_call_demo.sh
+```
+
+Expected result: one CDR with `answered: true`, `final_status: 200`, `hangup_cause: normal_clearing`. Use it to verify the runtime, actor, FSM, CDR and spool path after a change.
 
 For real calls, obtain and run the separate SIP adapter, configure a domain and two extensions, then register SIP endpoints. The optional `vs_web` service normally listens on port 18081; `vs_ai_gatewayd` provides its own management UI on 18082. Neither service is started by these commands. Change bootstrap passwords and secure management access before exposing a deployment.
 

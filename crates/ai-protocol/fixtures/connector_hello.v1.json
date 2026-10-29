@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "message_id": "message-1",
+  "timestamp_ms": 0,
+  "type": "connector_hello",
+  "payload": {
+    "connector_instance_id": "voipswitch-local",
+    "connector_kind": "voipswitch",
+    "supported_versions": [1],
+    "capabilities": ["audio_input", "post_call_job"]
+  }
+}

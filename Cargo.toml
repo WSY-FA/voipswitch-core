@@ -3,6 +3,8 @@ members = [
     "crates/voipswitch-core",
     "crates/voipswitchd",
     "crates/vs_cli",
+    "crates/ai-protocol",
+    "crates/vs_mock_adapterd",
 ]
 resolver = "3"
 

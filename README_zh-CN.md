@@ -4,9 +4,9 @@
 
 [English](README.md) | [简体中文](README_zh-CN.md) · [MIT 许可证](LICENSE)
 
-VoIPSwitch 将 SIP 协议状态与 PBX 业务逻辑分离。本仓库构建核心守护进程 `voipswitchd` 和本地管理客户端 `vs_cli`。Web 管理、SIP 适配和 AI 处理作为同机独立进程运行。
+VoIPSwitch 将 SIP 协议状态与 PBX 业务逻辑分离。本仓库构建核心守护进程 `voipswitchd`、本地管理客户端 `vs_cli`，以及用于本地演示和 CI 的 loopback 适配器 `vs_mock_adapterd`。Web 管理、SIP 适配和 AI 处理作为同机独立进程运行。
 
-> 项目仍处于开发阶段。SIP 适配器使用私有 SIP 协议栈，不包含在本仓库中。仅构建 Core，不能获得可用的 SIP 电话服务。
+> 项目仍处于开发阶段。生产用 SIP 适配器使用私有 SIP 协议栈，不包含在本仓库中。`vs_mock_adapterd` 只验证运行时协议，不发送 SIP 和 RTP，是测试工具，不是生产适配器。
 
 ## 功能
 
@@ -37,9 +37,8 @@ VoIPSwitch 将 SIP 协议状态与 PBX 业务逻辑分离。本仓库构建核�
 
 - Linux，以及支持 Rust edition 2024 的当前 stable 工具链。
 - 支持 BPF target 的 Clang：即使运行时只用用户态转发，当前构建脚本也会编译 eBPF 对象。
-- 将 `voipswitch-ai` 仓库放在 `voipswitch-core` 同级目录：`voipswitchd` 当前通过本地路径依赖 `../voipswitch-ai/crates/ai-protocol`。
 
-取得同级依赖前，不能假定本仓库可独立构建。目前不承诺最低 Rust 版本和硬件容量。
+本仓库可独立构建，AI 协议类型已包含在 workspace 中。目前不承诺最低 Rust 版本和硬件容量。
 
 在本仓库中运行：
 
@@ -58,6 +57,16 @@ cargo run -p vs_cli
 ```
 
 默认数据目录为 `data/`。Unix socket 默认位于 `$XDG_RUNTIME_DIR/voipswitch/`；未设置 `XDG_RUNTIME_DIR` 时使用 `/tmp/voipswitch/`。覆盖参数见各程序的 `--help`。
+
+### 不接 SIP 适配器也能跑一通呼叫
+
+`scripts/mock_call_demo.sh` 会在临时目录启动核心，创建演示域和分机 1001、1002，运行 `vs_mock_adapterd` 注册两端并发起一通呼叫，最后打印话单。全程不涉及 SIP 和 RTP，媒体统计保持为零。
+
+```bash
+bash scripts/mock_call_demo.sh
+```
+
+预期结果：一条 `answered: true`、`final_status: 200`、`hangup_cause: normal_clearing` 的话单。修改运行时、actor、FSM、CDR 或 spool 后，可用它做快速回归。
 
 真实通话还需要取得并启动独立 SIP 适配器，配置域和两个分机，再注册 SIP 终端。可选的 `vs_web` 通常监听 18081；`vs_ai_gatewayd` 的独立管理界面监听 18082。以上命令不会启动这两个服务。对外部署前，应修改初始密码并保护管理入口。
 

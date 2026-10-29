@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voipswitch.local/ai/control-envelope.schema.json",
+  "title": "VoIPSwitch AI control envelope",
+  "type": "object",
+  "required": ["protocol_version", "message_id", "timestamp_ms", "type", "payload"],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "message_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "timestamp_ms": { "type": "integer", "minimum": 0 },
+    "type": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}
