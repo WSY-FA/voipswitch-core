@@ -12,7 +12,16 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 use voipswitch_core::types::time::unix_timestamp_ms;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    Normal,
+    Reject,
+    CancelLateAnswer,
+    Disconnect,
+}
+
 pub struct Config {
+    pub mode: Mode,
     pub auto_call: Option<(String, String)>,
     pub provisional_delay: Duration,
     pub answer_delay: Duration,
@@ -50,6 +59,7 @@ pub struct Scenario {
     callee_leg: Option<String>,
     disconnected: BTreeSet<String>,
     finished: bool,
+    disconnect_after_answer: bool,
     queue: Vec<Scheduled>,
     registration_version: u64,
 }
@@ -68,6 +78,7 @@ impl Scenario {
             callee_leg: None,
             disconnected: BTreeSet::new(),
             finished: false,
+            disconnect_after_answer: false,
             queue: Vec::new(),
             registration_version: 0,
         }
@@ -101,9 +112,16 @@ impl Scenario {
         due.sort_by_key(|entry| entry.at);
         for entry in due {
             tracing::debug!(frame_type = %entry.frame.r#type, "sending runtime frame");
+            let sent_type = entry.frame.r#type.clone();
             tx.send(entry.frame)
                 .await
                 .context("scenario writer stopped")?;
+            if sent_type == "OutboundAnswered" && self.cfg.mode == Mode::CancelLateAnswer {
+                info!("injected OutboundAnswered after CANCEL");
+            }
+            if sent_type == "DialogDisconnected" && self.cfg.mode == Mode::Reject {
+                self.finished = true;
+            }
         }
         Ok(())
     }
@@ -127,12 +145,15 @@ impl Scenario {
                         bail!("core closed the runtime socket");
                     };
                     self.handle(frame, &tx).await?;
+                    if self.disconnect_after_answer {
+                        return Ok(());
+                    }
                 }
                 _ = timer, if next_at.is_some() => {
                     self.flush_due(&tx).await?;
                 }
             }
-            if self.finished {
+            if self.finished && self.queue.is_empty() {
                 return Ok(());
             }
         }
@@ -146,6 +167,11 @@ impl Scenario {
         match frame.r#type.as_str() {
             "ApplyRuntimeView" => self.apply_view(frame, tx).await,
             "CoreHelloAck" => Ok(()),
+            "OutboundAnsweredAck" if self.cfg.mode == Mode::CancelLateAnswer => {
+                info!("core acknowledged late answer cleanup");
+                self.finished = true;
+                Ok(())
+            }
             _ if frame.kind == "command" => self.handle_command(frame, tx).await,
             other => {
                 info!(frame_type = other, "ignoring runtime frame");
@@ -318,14 +344,77 @@ impl Scenario {
                     json!({ "data": { "adapter_call_leg_id": leg_id } }),
                 )
                 .await?;
-                self.schedule_callee_progress(leg_id);
+                match self.cfg.mode {
+                    Mode::Reject => {
+                        let caller_id = self.caller_leg.clone().context("caller leg missing")?;
+                        let caller = self.legs.get(&caller_id).context("caller leg missing")?;
+                        let caller_call_id = caller.call_id.clone();
+                        let caller_session_id = caller.session_id.clone();
+                        self.schedule(
+                            Duration::from_millis(30),
+                            protocol::LegEvent {
+                                frame_type: "OutboundFailed",
+                                call_id: &call_id,
+                                session_id: &session_id,
+                                adapter_call_leg_id: &leg_id,
+                                seq: 1,
+                                status_code: Some(486),
+                                sdp: None,
+                                reason: Some(17),
+                            }
+                            .into_envelope(),
+                        );
+                        self.schedule(
+                            Duration::from_millis(60),
+                            protocol::LegEvent {
+                                frame_type: "DialogDisconnected",
+                                call_id: &caller_call_id,
+                                session_id: &caller_session_id,
+                                adapter_call_leg_id: &caller_id,
+                                seq: 2,
+                                status_code: None,
+                                sdp: None,
+                                reason: Some(21),
+                            }
+                            .into_envelope(),
+                        );
+                    }
+                    Mode::CancelLateAnswer => {
+                        let caller_id = self.caller_leg.clone().context("caller leg missing")?;
+                        let caller = &self.legs[&caller_id];
+                        tx.send(
+                            protocol::LegEvent {
+                                frame_type: "InboundInviteCancelled",
+                                call_id: &caller.call_id,
+                                session_id: &caller.session_id,
+                                adapter_call_leg_id: &caller_id,
+                                seq: caller.seq,
+                                status_code: None,
+                                sdp: None,
+                                reason: None,
+                            }
+                            .into_envelope(),
+                        )
+                        .await?;
+                    }
+                    _ => self.schedule_callee_progress(leg_id),
+                }
             }
             "AnswerInboundInvite" => {
                 self.ack(&action, &request, tx, json!({})).await?;
-                self.schedule_hold();
+                if self.cfg.mode == Mode::Disconnect {
+                    info!("injected runtime disconnect after answer");
+                    self.disconnect_after_answer = true;
+                } else {
+                    self.schedule_hold();
+                }
             }
             "HangupDialog" => {
                 self.ack(&action, &request, tx, json!({})).await?;
+                if self.cfg.mode == Mode::CancelLateAnswer {
+                    info!("core requested cleanup of late answer");
+                    self.finished = true;
+                }
                 let leg_id = self
                     .legs
                     .iter()
@@ -348,7 +437,24 @@ impl Scenario {
                 if action == "CancelOutbound"
                     && let Some(leg_id) = self.callee_leg.clone()
                 {
-                    self.send_failed(&leg_id, 487, tx).await?;
+                    if self.cfg.mode == Mode::CancelLateAnswer {
+                        let leg = &self.legs[&leg_id];
+                        let frame = protocol::LegEvent {
+                            frame_type: "OutboundAnswered",
+                            call_id: &leg.call_id,
+                            session_id: &leg.session_id,
+                            adapter_call_leg_id: &leg_id,
+                            seq: leg.seq + 1,
+                            status_code: Some(200),
+                            sdp: Some(sdp::body(sdp::ANSWER)),
+                            reason: None,
+                        }
+                        .into_envelope();
+                        info!("injected OutboundAnswered after CANCEL");
+                        self.schedule(Duration::from_millis(30), frame);
+                    } else {
+                        self.send_failed(&leg_id, 487, tx).await?;
+                    }
                 }
             }
             _ => {

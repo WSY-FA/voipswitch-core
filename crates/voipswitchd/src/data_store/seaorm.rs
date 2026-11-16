@@ -8,13 +8,14 @@ use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
     TransactionTrait,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::runtime::{Handle, Runtime};
+use tokio::sync::Mutex;
 use voipswitch_core::media::MediaForwardingMode;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct SeaOrmConfigBackend {
     data_dir: PathBuf,
     instance_id: String,
     runtime: Arc<Runtime>,
+    domain_schema_locks: Arc<std::sync::Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>>,
 }
 
 impl SeaOrmConfigBackend {
@@ -31,6 +33,7 @@ impl SeaOrmConfigBackend {
             data_dir: data_dir.into(),
             instance_id: instance_id.into(),
             runtime: Arc::new(Runtime::new().context("create SeaORM runtime")?),
+            domain_schema_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -76,6 +79,22 @@ impl SeaOrmConfigBackend {
                 .with_context(|| format!("create domain cdr dir {}", parent.display()))?;
         }
         let conn = connect_sqlite(&path).await?;
+        let lock = {
+            let mut locks = self
+                .domain_schema_locks
+                .lock()
+                .expect("domain schema lock map poisoned");
+            locks.retain(|_, weak| weak.strong_count() > 0);
+            match locks.get(&path).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(path.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _guard = lock.lock().await;
         ensure_cdr_schema(&conn).await?;
         ensure_call_trace_schema(&conn).await?;
         ensure_recording_schema(&conn).await?;
@@ -1814,6 +1833,101 @@ mod tests {
             },
             received_at_ms: 1_000,
         }
+    }
+
+    #[test]
+    fn concurrent_first_open_and_cdr_write_share_per_database_schema_lock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let backend = Arc::new(SeaOrmConfigBackend::sqlite(temp.path(), "test")?);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let start_rx = Arc::new(std::sync::Mutex::new(start_rx));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let backend = backend.clone();
+            let start_rx = start_rx.clone();
+            workers.push(std::thread::spawn(move || {
+                start_rx.lock().unwrap().recv().unwrap();
+                if index % 2 == 0 {
+                    backend.block_on(async {
+                        let domain = if index == 0 { "domain-b" } else { "domain-a" };
+                        let conn = backend.open_domain_cdr_db(domain).await?;
+                        conn.query_one(Statement::from_string(
+                            DbBackend::Sqlite,
+                            "SELECT count(*) AS count FROM call_cdr".to_string(),
+                        ))
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                } else {
+                    let record = CdrRecord {
+                        call_id: "concurrent-call".to_string(),
+                        domain_id: "domain-a".to_string(),
+                        caller_number: "1001".to_string(),
+                        callee_number: "1002".to_string(),
+                        inbound_route_id: None,
+                        inbound_route_name: None,
+                        inbound_trunk_ref: None,
+                        inbound_trunk_name: None,
+                        outbound_route_id: None,
+                        outbound_route_name: None,
+                        outbound_trunk_ref: None,
+                        outbound_trunk_name: None,
+                        started_at_ms: 1,
+                        answered_at_ms: Some(2),
+                        ended_at_ms: 3,
+                        duration_ms: 2,
+                        billable_ms: 1,
+                        answered: true,
+                        final_status: Some(200),
+                        hangup_cause: "normal_clearing".to_string(),
+                        media_forwarding_mode: None,
+                        caller_to_callee_packets: 0,
+                        caller_to_callee_bytes: 0,
+                        callee_to_caller_packets: 0,
+                        callee_to_caller_bytes: 0,
+                        caller_to_callee_rtcp_packets: 0,
+                        callee_to_caller_rtcp_packets: 0,
+                        trace_available: false,
+                        trace_incomplete: false,
+                        recording_status: None,
+                        recording_available: false,
+                        incomplete: false,
+                        incomplete_reason: None,
+                    };
+                    backend.insert_cdr(&record)
+                }
+            }));
+        }
+        for _ in 0..workers.len() {
+            start_tx.send(()).unwrap();
+        }
+        for worker in workers {
+            worker.join().expect("schema worker panicked")?;
+        }
+        backend.block_on(async {
+            let connection = backend.open_domain_cdr_db("domain-b").await?;
+            connection.ping().await?;
+            let rows = connection
+                .query_all(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA table_info(call_cdr)".to_string(),
+                ))
+                .await?;
+            assert!(
+                rows.iter()
+                    .any(|row| row.try_get::<String>("", "name").as_deref() == Ok("incomplete"))
+            );
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let page = backend.list_cdr(
+            Some("domain-a"),
+            PageRequest {
+                page: 1,
+                page_size: 20,
+            },
+        )?;
+        assert_eq!(page.total, 1);
+        Ok(())
     }
 
     #[test]

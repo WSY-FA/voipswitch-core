@@ -44,4 +44,4 @@ jobs:
         run: cargo test --workspace
 
       - name: Loopback call end to end
-        run: XDG_RUNTIME_DIR="$RUNNER_TEMP/voipswitch-run" bash scripts/mock_call_demo.sh
+        run: bash scripts/mock_call_regression.sh

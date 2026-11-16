@@ -33,6 +33,10 @@ struct Args {
     #[arg(long)]
     auto_call: Option<String>,
 
+    /// Deterministic fault injection at runtime action boundaries.
+    #[arg(long, value_enum, default_value_t = scenario::Mode::Normal)]
+    scenario: scenario::Mode,
+
     /// Keep running after the auto call completes.
     #[arg(long)]
     keep_running: bool,
@@ -157,6 +161,7 @@ async fn main() -> Result<()> {
     });
 
     let config = scenario::Config {
+        mode: args.scenario,
         auto_call: auto_call.clone(),
         provisional_delay: Duration::from_millis(args.provisional_delay_ms),
         answer_delay: Duration::from_millis(args.answer_delay_ms),
@@ -181,6 +186,9 @@ async fn main() -> Result<()> {
 
     drop(out_tx);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer_task).await;
+    if args.scenario == scenario::Mode::Disconnect {
+        info!("runtime socket closed for disconnect scenario");
+    }
 
     match outcome {
         Ok(()) => {
@@ -214,6 +222,7 @@ mod tests {
 
     fn args(auto_call: Option<&str>) -> Args {
         Args {
+            scenario: scenario::Mode::Normal,
             runtime_socket: None,
             auto_call: auto_call.map(str::to_string),
             keep_running: false,
